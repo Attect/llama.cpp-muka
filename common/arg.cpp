@@ -2179,6 +2179,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
     add_opt(common_arg(
+        {"--mmproj-gpu-swap"},
+        {"--no-mmproj-gpu-swap"},
+        string_format("whether to enable GPU swap mode for multimodal projector - offload model to CPU when encoding images on GPU (default: %s)", params.mmproj_gpu_swap ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.mmproj_gpu_swap = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_GPU_SWAP"));
+    add_opt(common_arg(
+        {"--mmproj-cache-dir"}, "DIR",
+        "directory for image tokenization cache (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.mmproj_cache_dir = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_CACHE_DIR"));
+    add_opt(common_arg(
         {"--image", "--audio"}, "FILE",
         "path to an image or audio file. use with multimodal models, use comma-separated values for multiple files\n",
         [](common_params & params, const std::string & value) {
