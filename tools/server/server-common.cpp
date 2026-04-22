@@ -653,8 +653,9 @@ int32_t server_tokens::process_chunk(
     }
 
     // Step 4: GPU swap - upload model back to GPU, download mmproj from CPU
-    // This must happen before decode, because llama_decode needs the model on GPU
-    if (gpu_swap_ctx && gpu_swap_ctx->enabled && model_for_swap) {
+    // Only needed if we actually encoded the image (cache miss)
+    // If cache hit, mmproj was never uploaded so no need to swap back
+    if (!cache_hit && gpu_swap_ctx && gpu_swap_ctx->enabled && model_for_swap) {
         if (!gpu_swap_ctx->swap_to_model_gpu(mctx, model_for_swap, ctx)) {
             SRV_WRN("GPU swap to model failed, decode may be degraded\n%s", "");
         }
