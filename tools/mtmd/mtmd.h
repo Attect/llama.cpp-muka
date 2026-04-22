@@ -96,6 +96,11 @@ struct mtmd_context_params {
     // callback function passed over to mtmd proper
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    // GPU swap mode: when enabled, mmproj weights are allocated on CPU initially,
+    // and can be dynamically uploaded/downloaded to/from GPU to share VRAM with the text model.
+    // This allows running large models + mmproj on limited VRAM by trading off swap latency.
+    bool gpu_swap_mode;
 };
 
 MTMD_API const char * mtmd_default_marker(void);
@@ -326,6 +331,26 @@ struct input_chunks {
 };
 
 } // namespace mtmd
+
+// GPU swap support at mtmd level
+// These wrappers allow server code to manage clip GPU memory without directly accessing clip_ctx
+
+// Upload clip model weights from CPU to GPU (for GPU swap mode)
+// Must be called when gpu_swap_mode is enabled and weights are on CPU
+// Returns true on success
+MTMD_API bool mtmd_gpu_swap_upload(mtmd_context * ctx);
+
+// Download clip model weights from GPU back to CPU (for GPU swap mode)
+// Must be called when gpu_swap_mode is enabled and weights are on GPU
+// Returns true on success
+MTMD_API bool mtmd_gpu_swap_download(mtmd_context * ctx);
+
+// Check if GPU swap mode is enabled
+MTMD_API bool mtmd_is_gpu_swap_mode(mtmd_context * ctx);
+
+// Get the internal clip_ctx for vision (needed by server-level GPU swap manager)
+// This allows the server's gpu_swap_manager to call clip_gpu_upload/clip_gpu_download directly
+MTMD_API struct clip_ctx * mtmd_get_clip_ctx(mtmd_context * ctx);
 
 #endif
 
