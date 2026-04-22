@@ -543,6 +543,8 @@ struct common_params {
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
     bool no_mmproj = false;         // explicitly disable multimodal model
+    bool mmproj_gpu_swap = false;   // enable GPU swap mode for mmproj - offload model to CPU when encoding images on GPU
+    std::string mmproj_cache_dir;   // directory for image tokenization cache
     std::vector<std::string> image; // path to image file(s)
     int image_min_tokens = -1;
     int image_max_tokens = -1;
