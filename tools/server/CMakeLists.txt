@@ -17,6 +17,8 @@ add_library(${TARGET} STATIC
     server-context.h
     server-tools.cpp
     server-tools.h
+    ../mtmd/mtmd-cache.cpp
+    ../mtmd/mtmd-cache.h
 )
 
 if (BUILD_SHARED_LIBS)
