@@ -8,6 +8,8 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "server-gpu-swap.h"
+#include "mtmd-cache.h"
 
 #include <random>
 #include <sstream>
@@ -537,24 +539,140 @@ int32_t server_tokens::process_chunk(
             size_t idx,
             llama_pos pos,
             int32_t seq_id,
-            size_t & n_tokens_out) const {
+            size_t & n_tokens_out,
+            gpu_swap_manager * gpu_swap_ctx,
+            mtmd_cache * cache_ctx,
+            llama_model * model_for_swap) const {
     const auto & chunk = find_chunk(idx);
-    const char * name = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
+    auto chunk_type = mtmd_input_chunk_get_type(chunk.get());
+    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE
                         ? "image" : "audio";
     SRV_INF("processing %s...\n", name);
     int32_t n_batch = llama_n_batch(ctx);
     int64_t t0 = ggml_time_ms();
-    llama_pos new_n_past; // unused for now
-    int32_t result = mtmd_helper_eval_chunk_single(mctx, ctx,
+
+    if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
+        // Text chunks: no GPU swap or cache needed
+        llama_pos new_n_past; // unused for now
+        int32_t result = mtmd_helper_eval_chunk_single(mctx, ctx,
+            chunk.get(),
+            pos,
+            seq_id,
+            n_batch,
+            true, // logits last
+            &new_n_past);
+        SRV_INF("%s processed in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
+        if (result != 0) {
+            LOG_ERR("mtmd_helper_eval failed with status %d", result);
+            n_tokens_out = 0;
+            return result;
+        }
+        n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+        return 0;
+    }
+
+    // === Image/Audio chunk processing with GPU swap and cache ===
+
+    bool is_image = (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE);
+    bool cache_hit = false;
+    std::vector<float> cached_embd;
+    uint32_t cached_n_tokens = 0, cached_n_embd = 0;
+    bool cached_use_mrope_pos = false;
+
+    // Step 1: Cache lookup (image chunks only)
+    if (cache_ctx && is_image) {
+        const char * chunk_id = mtmd_input_chunk_get_id(chunk.get());
+        if (chunk_id && chunk_id[0] != '\0') {
+            const auto * img_tokens = mtmd_input_chunk_get_tokens_image(chunk.get());
+            uint32_t img_nx = img_tokens ? (uint32_t)mtmd_image_tokens_get_nx(img_tokens) : 0;
+            uint32_t img_ny = img_tokens ? (uint32_t)mtmd_image_tokens_get_ny(img_tokens) : 0;
+
+            // Use a generic projector type for cache lookup
+            // The mmproj hash in the cache key already ensures model-specific invalidation
+            cache_hit = cache_ctx->lookup_by_hash(
+                std::string(chunk_id),
+                img_nx, img_ny,
+                mtmd_projector_type::UNKNOWN,  // generic; mmproj_hash handles model specificity
+                cached_embd,
+                cached_n_tokens, cached_n_embd,
+                cached_use_mrope_pos);
+        }
+    }
+
+    // Step 2: GPU swap - offload model to CPU, upload mmproj to GPU
+    // Skip if cache hit (no encoding needed)
+    if (!cache_hit && gpu_swap_ctx && gpu_swap_ctx->enabled) {
+        if (!gpu_swap_ctx->swap_to_mmproj_gpu(mctx, model_for_swap, ctx)) {
+            SRV_WRN("GPU swap to mmproj failed, encoding will use current GPU state\n%s", "");
+        }
+    }
+
+    // Step 3: Encode the image/audio chunk (skip if cache hit)
+    float * embd = nullptr;
+    int32_t result = 0;
+
+    if (!cache_hit) {
+        SRV_INF("encoding %s...\n", name);
+        result = mtmd_encode_chunk(mctx, chunk.get());
+        if (result != 0) {
+            LOG_ERR("failed to encode %s slice\n", name);
+            // Swap back model even on failure
+            if (gpu_swap_ctx && gpu_swap_ctx->enabled && model_for_swap) {
+                gpu_swap_ctx->swap_to_model_gpu(mctx, model_for_swap, ctx);
+            }
+            n_tokens_out = 0;
+            return result;
+        }
+        embd = mtmd_get_output_embd(mctx);
+
+        // Step 3b: Cache store (image chunks only)
+        if (cache_ctx && is_image) {
+            const char * chunk_id = mtmd_input_chunk_get_id(chunk.get());
+            if (chunk_id && chunk_id[0] != '\0') {
+                const auto * img_tokens = mtmd_input_chunk_get_tokens_image(chunk.get());
+                uint32_t img_nx = img_tokens ? (uint32_t)mtmd_image_tokens_get_nx(img_tokens) : 0;
+                uint32_t img_ny = img_tokens ? (uint32_t)mtmd_image_tokens_get_ny(img_tokens) : 0;
+                uint32_t n_tokens = (uint32_t)mtmd_input_chunk_get_n_tokens(chunk.get());
+                const llama_model * lmodel = llama_get_model(ctx);
+                uint32_t n_embd = (uint32_t)llama_model_n_embd_inp(lmodel);
+
+                bool use_mrope = mtmd_decode_use_mrope(mctx);
+
+                cache_ctx->store_by_hash(
+                    std::string(chunk_id),
+                    img_nx, img_ny,
+                    mtmd_projector_type::UNKNOWN,
+                    embd,
+                    n_tokens, n_embd,
+                    use_mrope);
+            }
+        }
+    } else {
+        SRV_INF("%s cache hit, skipping encode\n", name);
+        embd = cached_embd.data();
+    }
+
+    // Step 4: GPU swap - upload model back to GPU, download mmproj from CPU
+    // This must happen before decode, because llama_decode needs the model on GPU
+    if (gpu_swap_ctx && gpu_swap_ctx->enabled && model_for_swap) {
+        if (!gpu_swap_ctx->swap_to_model_gpu(mctx, model_for_swap, ctx)) {
+            SRV_WRN("GPU swap to model failed, decode may be degraded\n%s", "");
+        }
+    }
+
+    // Step 5: Decode the image/audio embeddings with the text model
+    llama_pos new_n_past;
+    result = mtmd_helper_decode_image_chunk(mctx, ctx,
         chunk.get(),
+        embd,
         pos,
         seq_id,
         n_batch,
-        true, // logits last
         &new_n_past);
+
     SRV_INF("%s processed in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
     if (result != 0) {
-        LOG_ERR("mtmd_helper_eval failed with status %d", result);
+        LOG_ERR("mtmd_helper_decode failed with status %d", result);
         n_tokens_out = 0;
         return result;
     }
