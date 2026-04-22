@@ -827,19 +827,14 @@ private:
              mparams.image_max_tokens = params_base.image_max_tokens;
              mparams.media_marker     = get_media_marker();
 
-             // GPU swap mode: allocate mmproj on CPU initially so it can be
-             // dynamically uploaded/downloaded to share VRAM with the text model
+             // GPU swap mode: allow swapping mmproj between CPU and GPU to share VRAM with text model
              if (params_base.mmproj_gpu_swap) {
-                 if (!params_base.mmproj_use_gpu) {
-                     SRV_ERR("%s", "--mmproj-gpu-swap and --no-mmproj-offload are mutually exclusive\n");
-                     return false;
-                 }
                  mparams.gpu_swap_mode = true;
 
-                 // CRITICAL: When gpu_swap_mode is enabled, mmproj must be loaded to CPU first
-                 // so it can be dynamically swapped with the text model on GPU.
-                 // Override use_gpu to false - the swap manager will upload mmproj to GPU when needed.
-                 mparams.use_gpu = false;
+                 // Only enable swap manager if mmproj is on CPU (--no-mmproj-offload specified).
+                 // If mmproj_use_gpu is true (default), mmproj stays on GPU and no swap is needed.
+                gpu_swap = std::make_unique<gpu_swap_manager>();
+                gpu_swap->enabled = !params_base.mmproj_use_gpu;
 
                  // GPU swap requires single slot to avoid concurrent GPU state conflicts
                  if (params_base.n_parallel > 1) {
@@ -847,7 +842,11 @@ private:
                      params_base.n_parallel = 1;
                  }
 
-                 SRV_INF("%s", "GPU swap mode enabled: model and mmproj will share GPU memory\n");
+                 if (gpu_swap->enabled) {
+                     SRV_INF("%s", "GPU swap mode enabled: mmproj on CPU, will swap with text model on GPU\n");
+                 } else {
+                     SRV_INF("%s", "GPU swap mode enabled but mmproj already on GPU (no --no-mmproj-offload), skipping swap\n");
+                 }
              }
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model, mparams);
@@ -856,13 +855,6 @@ private:
                 return false;
             }
                SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
-
-            // Initialize GPU swap manager
-            if (params_base.mmproj_gpu_swap) {
-                gpu_swap = std::make_unique<gpu_swap_manager>();
-                gpu_swap->enabled = true;
-                SRV_INF("%s", "GPU swap manager initialized\n");
-            }
 
             // Initialize image tokenization cache
             if (!params_base.mmproj_cache_dir.empty()) {
