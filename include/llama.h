@@ -497,7 +497,12 @@ extern "C" {
     DEPRECATED(LLAMA_API void llama_free_model(struct llama_model * model),
             "use llama_model_free instead");
 
-    LLAMA_API void llama_model_free(struct llama_model * model);
+     LLAMA_API void llama_model_free(struct llama_model * model);
+
+    // Access model tensors (used by GPU swap manager)
+    LLAMA_API size_t llama_model_n_tensors(const struct llama_model * model);
+    LLAMA_API const char * llama_model_get_tensor_name(const struct llama_model * model, size_t i);
+    LLAMA_API struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
 
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
@@ -510,6 +515,10 @@ extern "C" {
 
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
+
+    // Reset the backend scheduler to re-evaluate backend assignments for tensors
+    // Used after GPU swap operations to update tensor location tracking
+    LLAMA_API void llama_context_sched_update(struct llama_context * ctx);
 
     LLAMA_API int64_t llama_time_us(void);
 

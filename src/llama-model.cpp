@@ -9465,3 +9465,24 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
     }
     return model->devices[i].dev;
 }
+
+// Access model tensors (used by GPU swap manager)
+size_t llama_model_n_tensors(const struct llama_model * model) {
+    if (!model) return 0;
+    return model->tensors_by_name.size();
+}
+
+const char * llama_model_get_tensor_name(const struct llama_model * model, size_t i) {
+    if (!model || i >= model->tensors_by_name.size()) return nullptr;
+    return model->tensors_by_name[i].first.c_str();
+}
+
+struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name) {
+    if (!model || !name) return nullptr;
+    auto it = std::find_if(model->tensors_by_name.begin(), model->tensors_by_name.end(),
+            [name](const std::pair<std::string, ggml_tensor *> & it) {
+                return it.first == name;
+            });
+    if (it == model->tensors_by_name.end()) return nullptr;
+    return it->second;
+}

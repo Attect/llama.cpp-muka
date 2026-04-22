@@ -3531,3 +3531,15 @@ void llama_opt_epoch(
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
 }
+
+// Reset the backend scheduler to re-evaluate backend assignments for tensors
+// Used after GPU swap operations to update tensor location tracking
+void llama_context_sched_update(struct llama_context * ctx) {
+    if (!ctx) return;
+    // Reset the scheduler to clear old allocations and assignments
+    ggml_backend_sched_reset(ctx->get_sched());
+    // Mark scheduler for re-reserve on next use
+    // This ensures the scheduler re-evaluates which backend handles each operation
+    // based on the current tensor locations (which may have changed due to GPU swap)
+    ctx->sched_reserve();
+}
