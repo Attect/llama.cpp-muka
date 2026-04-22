@@ -2427,9 +2427,25 @@ struct clip_model_loader {
             std::vector<uint8_t> read_buf;
 
             // alloc memory and offload data
-            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
-            ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
-            ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            ggml_backend_buffer_type_t buft;
+            if (ctx_clip.gpu_swap_mode) {
+                // GPU swap mode: always allocate on CPU, keep CPU buffer as backup
+                buft = ggml_backend_get_default_buffer_type(ctx_clip.backend_cpu);
+                ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+                ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                ctx_clip.buf_gpu = nullptr;
+
+                // Save CPU tensor address mapping for later restoration after GPU upload
+                for (struct ggml_tensor * t = ggml_get_first_tensor(ctx_clip.ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx_clip.ctx_data.get(), t)) {
+                    ctx_clip.cpu_data_ptrs[t] = t->data;
+                    ctx_clip.cpu_buffer_ptrs[t] = t->buffer;
+                }
+            } else {
+                // Original logic: allocate on the default backend (GPU if available, else CPU)
+                buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
+                ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+                ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
             for (auto & t : tensors_to_load) {
                 ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
                 GGML_ASSERT(cur && "tensor not found in ctx_data");
