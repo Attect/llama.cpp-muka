@@ -1448,3 +1448,50 @@ void mtmd_debug_preprocess_audio(mtmd_context * ctx, const std::vector<float> & 
         }
     }
 }
+
+//
+// GPU swap support at mtmd level
+// These wrappers allow server code to manage clip GPU memory without directly accessing clip_ctx
+
+bool mtmd_gpu_swap_upload(mtmd_context * ctx) {
+    if (!ctx) return false;
+    // Upload both vision and audio clip models
+    bool ok = true;
+    if (ctx->ctx_v) {
+        ok = clip_gpu_upload(ctx->ctx_v) && ok;
+    }
+    if (ctx->ctx_a) {
+        ok = clip_gpu_upload(ctx->ctx_a) && ok;
+    }
+    return ok;
+}
+
+bool mtmd_gpu_swap_download(mtmd_context * ctx) {
+    if (!ctx) return false;
+    bool ok = true;
+    if (ctx->ctx_v) {
+        ok = clip_gpu_download(ctx->ctx_v) && ok;
+    }
+    if (ctx->ctx_a) {
+        ok = clip_gpu_download(ctx->ctx_a) && ok;
+    }
+    return ok;
+}
+
+bool mtmd_is_gpu_swap_mode(mtmd_context * ctx) {
+    if (!ctx) return false;
+    // Check vision context (primary use case)
+    if (ctx->ctx_v) {
+        return clip_is_gpu_swap_mode(ctx->ctx_v);
+    }
+    if (ctx->ctx_a) {
+        return clip_is_gpu_swap_mode(ctx->ctx_a);
+    }
+    return false;
+}
+
+struct clip_ctx * mtmd_get_clip_ctx(mtmd_context * ctx) {
+    if (!ctx) return nullptr;
+    // Return vision context by default (used for GPU swap with image encoding)
+    return ctx->ctx_v ? ctx->ctx_v : ctx->ctx_a;
+}
