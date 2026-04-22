@@ -819,31 +819,36 @@ private:
             mtmd_context_params mparams = mtmd_context_params_default();
 
              mparams.use_gpu          = params_base.mmproj_use_gpu;
-            mparams.print_timings    = false;
-            mparams.n_threads        = params_base.cpuparams.n_threads;
-            mparams.flash_attn_type  = params_base.flash_attn_type;
-            mparams.warmup           = params_base.warmup;
-            mparams.image_min_tokens = params_base.image_min_tokens;
-            mparams.image_max_tokens = params_base.image_max_tokens;
-            mparams.media_marker     = get_media_marker();
+             mparams.print_timings    = false;
+             mparams.n_threads        = params_base.cpuparams.n_threads;
+             mparams.flash_attn_type  = params_base.flash_attn_type;
+             mparams.warmup           = params_base.warmup;
+             mparams.image_min_tokens = params_base.image_min_tokens;
+             mparams.image_max_tokens = params_base.image_max_tokens;
+             mparams.media_marker     = get_media_marker();
 
-            // GPU swap mode: allocate mmproj on CPU initially so it can be
-            // dynamically uploaded/downloaded to share VRAM with the text model
-            if (params_base.mmproj_gpu_swap) {
-                if (!params_base.mmproj_use_gpu) {
-                    SRV_ERR("%s", "--mmproj-gpu-swap and --no-mmproj-offload are mutually exclusive\n");
-                    return false;
-                }
-                mparams.gpu_swap_mode = true;
+             // GPU swap mode: allocate mmproj on CPU initially so it can be
+             // dynamically uploaded/downloaded to share VRAM with the text model
+             if (params_base.mmproj_gpu_swap) {
+                 if (!params_base.mmproj_use_gpu) {
+                     SRV_ERR("%s", "--mmproj-gpu-swap and --no-mmproj-offload are mutually exclusive\n");
+                     return false;
+                 }
+                 mparams.gpu_swap_mode = true;
 
-                // GPU swap requires single slot to avoid concurrent GPU state conflicts
-                if (params_base.n_parallel > 1) {
-                    SRV_WRN("%s", "--mmproj-gpu-swap requires single slot, forcing n_parallel=1\n");
-                    params_base.n_parallel = 1;
-                }
+                 // CRITICAL: When gpu_swap_mode is enabled, mmproj must be loaded to CPU first
+                 // so it can be dynamically swapped with the text model on GPU.
+                 // Override use_gpu to false - the swap manager will upload mmproj to GPU when needed.
+                 mparams.use_gpu = false;
 
-                SRV_INF("%s", "GPU swap mode enabled: model and mmproj will share GPU memory\n");
-            }
+                 // GPU swap requires single slot to avoid concurrent GPU state conflicts
+                 if (params_base.n_parallel > 1) {
+                     SRV_WRN("%s", "--mmproj-gpu-swap requires single slot, forcing n_parallel=1\n");
+                     params_base.n_parallel = 1;
+                 }
+
+                 SRV_INF("%s", "GPU swap mode enabled: model and mmproj will share GPU memory\n");
+             }
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model, mparams);
             if (mctx == nullptr) {
