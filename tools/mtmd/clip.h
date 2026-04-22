@@ -51,6 +51,41 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 
 void clip_free(struct clip_ctx * ctx);
 
+// GPU swap support: upload/download clip weights between CPU and GPU
+// Used with --mmproj-gpu-swap mode for dynamic GPU memory management
+
+/**
+ * Upload clip model weights from CPU to GPU
+ * Must be called when weights are on CPU buffer
+ * After this, clip encoding will run on GPU
+ * @param ctx clip context
+ * @return true on success, false on failure
+ */
+bool clip_gpu_upload(struct clip_ctx * ctx);
+
+/**
+ * Download clip model weights from GPU back to CPU
+ * Must be called when weights are on GPU buffer
+ * After this, GPU memory used by clip weights is freed
+ * @param ctx clip context
+ * @return true on success, false on failure
+ */
+bool clip_gpu_download(struct clip_ctx * ctx);
+
+/**
+ * Check if clip is in GPU swap mode
+ * @param ctx clip context
+ * @return true if gpu_swap_mode is enabled
+ */
+bool clip_is_gpu_swap_mode(const struct clip_ctx * ctx);
+
+/**
+ * Set GPU swap mode (must be called before clip_init finishes)
+ * @param ctx clip context
+ * @param enabled whether to enable GPU swap mode
+ */
+void clip_set_gpu_swap_mode(struct clip_ctx * ctx, bool enabled);
+
 size_t clip_embd_nbytes(const struct clip_ctx * ctx);
 size_t clip_embd_nbytes_by_img(const struct clip_ctx * ctx, int img_w, int img_h);
 
