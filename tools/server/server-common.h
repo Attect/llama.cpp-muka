@@ -13,6 +13,10 @@
 #include <vector>
 #include <cinttypes>
 
+// Forward declarations for GPU swap and cache support
+struct gpu_swap_manager;
+struct mtmd_cache;
+
 using json = nlohmann::ordered_json;
 
 #define SLT_INF(slot, fmt, ...) LOG_INF("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
@@ -216,13 +220,17 @@ public:
     bool validate(const struct llama_context * ctx) const;
 
     // encode and decode the image chunk
+    // gpu_swap_ctx and cache_ctx are optional; when provided, GPU swap and cache are integrated
     int32_t process_chunk(
                 llama_context * ctx,
                 mtmd_context * mctx,
                 size_t idx,
                 llama_pos pos,
                 int32_t seq_id,
-                size_t & n_tokens_out) const;
+                size_t & n_tokens_out,
+                gpu_swap_manager * gpu_swap_ctx = nullptr,
+                mtmd_cache * cache_ctx = nullptr,
+                llama_model * model_for_swap = nullptr) const;
 
     server_tokens clone() const;
 };
