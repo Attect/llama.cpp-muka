@@ -3899,12 +3899,27 @@ bool clip_gpu_upload(struct clip_ctx * ctx) {
     if (!ctx || !ctx->gpu_swap_mode) return false;
     if (ctx->buf_gpu) return true; // already on GPU
 
-    // Check if backend is GPU (not CPU)
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        return false; // backend is CPU, no GPU to upload to
+    // Find CUDA backend for GPU upload
+    ggml_backend_t cuda_backend = nullptr;
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        const char *       reg_name = ggml_backend_reg_name(reg);
+        if (std::string(reg_name) == "CPU") {
+            continue;
+        }
+        // Check if this is a CUDA or GPU backend
+        if (strstr(reg_name, "CUDA") || strstr(reg_name, "cuda")) {
+            cuda_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+            break;
+        }
     }
 
-    ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(ctx->backend);
+    if (!cuda_backend) {
+        LOG_WRN("clip_gpu_upload: no CUDA backend found, cannot upload to GPU\n");
+        return false;
+    }
+
+    ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(cuda_backend);
 
     // Calculate total size needed for GPU buffer with alignment
     size_t total_size = 0;
