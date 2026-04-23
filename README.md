@@ -1,4 +1,109 @@
-# llama.cpp
+# llama.cpp (mmproj-gpu-swap fork)
+
+> **本仓库是 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的功能增强分支，基于 `feat/mmproj-gpu-swap-cache` 分支。**
+> 以下内容描述了本分支相对于官方版本的差异。官方版本的原始 README 见 [下方](#官方-readme)。
+
+----
+
+## 与官方版本的差异：mmproj GPU Swap 机制
+
+### 概述
+
+在单显卡环境下运行视觉语言模型（VLM）时，模型本体（~16GB）和 mmproj 视觉编码器（~1.7GB）通常无法同时放入显存。官方 llama.cpp 的处理方式是将 mmproj 放在 CPU 上推理，导致图像编码速度极慢（数十分钟 vs GPU 的数秒）。
+
+本分支实现了 **mmproj GPU Swap** 机制：在文字推理时，模型本体占用 GPU；在图像推理时，将模型本体临时卸载到 CPU 内存，将 mmproj 加载到 GPU 进行推理；推理完成后，再换回模型本体。整个过程始终在 GPU 上执行，避免了 CPU 推理的性能惩罚。
+
+### 工作原理
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    GPU 显存 (24GB)                       │
+│                                                         │
+│  文字推理阶段:                                           │
+│  ┌──────────────────────┐  ┌──────────────────────────┐ │
+│  │   模型本体 (~16GB)    │  │ KV Cache + Compute (~7GB)│ │
+│  └──────────────────────┘  └──────────────────────────┘ │
+│                                                         │
+│  图像推理阶段 (swap 后):                                  │
+│  ┌──────────────────────┐  ┌──────────────────────────┐ │
+│  │   mmproj (~1.7GB)    │  │ KV Cache + Compute (~7GB)│ │
+│  └──────────────────────┘  └──────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│                  CPU 内存                                │
+│                                                         │
+│  图像推理阶段:                                           │
+│  ┌──────────────────────┐                               │
+│  │  模型权重备份 (~16GB) │ ← 从显存卸载，推理完后换回     │
+│  └──────────────────────┘                               │
+└─────────────────────────────────────────────────────────┘
+```
+
+1. **文字推理**：模型本体在 GPU，mmproj 在 CPU 内存（不占显存）
+2. **图像推理**：将模型权重从 GPU 卸载到 CPU → 将 mmproj 从 CPU 上传到 GPU → GPU 编码图像 → 将 mmproj 从 GPU 卸载 → 将模型权重从 CPU 加载回 GPU
+3. **继续文字推理**：模型本体重新在 GPU 上运行
+
+### 触发条件
+
+GPU Swap 仅在模型过大、显存不足以同时容纳模型和 mmproj 时启用：
+
+| 模型类型 | 文件大小阈值 | 说明 |
+|---------|-------------|------|
+| 稠密模型 | ≥ 16 GB | 如 Qwen3.6-27B Q4_K_XL |
+| MOE模型 | ≥ 21 GB | 如 Mixtral 等 |
+
+如果模型大小低于阈值，说明显存足够同时容纳两者，无需交换。
+
+### 命令行参数
+
+| 参数 | 说明 |
+|------|------|
+| `--mmproj-gpu-swap` | 启用 mmproj GPU swap 模式 |
+| `--mmproj <path>` | 指定 mmproj 模型文件路径 |
+| `--mmproj-cache-dir <dir>` | 图像 token 化缓存目录，避免重复编码同一图像 |
+
+**注意**：启用 `--mmproj-gpu-swap` 时，`n_parallel` 会被自动强制为 1（单并发），以减少 KV Cache 显存占用并避免并发 GPU 状态冲突。
+
+### 使用示例
+
+```sh
+llama-server \
+  -m Qwen3.6-27B-UD-Q4_K_XL.gguf \
+  --mmproj mmproj-F32.gguf \
+  --mmproj-gpu-swap \
+  -ngl 99 \
+  -c 180000 \
+  --mmproj-cache-dir ./image-cache
+```
+
+### 性能对比
+
+| 场景 | 无 GPU Swap (CPU推理) | 有 GPU Swap (GPU推理) |
+|------|----------------------|----------------------|
+| 图像编码 (1472x1472) | ~30 分钟 | ~6 秒 |
+| Swap 开销 | 无 | ~5 秒 (卸载+上传+回载) |
+| 每次图像请求总耗时 | ~30 分钟 | ~11 秒 |
+
+### 限制
+
+- 仅支持单 GPU、单并发场景
+- Swap 过程需要 ~5 秒的显存搬运开销
+- 需要足够的 CPU 内存来缓存模型权重备份（约等于模型文件大小）
+- 目前仅支持 NVIDIA CUDA GPU
+
+### 实现细节
+
+核心修改涉及以下文件：
+
+- **`tools/server/server-context.cpp`**：模型加载时根据模型类型和大小判断是否启用 swap，并在 context 创建前强制 `n_parallel=1`
+- **`tools/server/server-gpu-swap.cpp`**：`swap_to_mmproj_gpu()` 和 `swap_to_model_gpu()` 实现模型权重与 mmproj 在 GPU/CPU 间的动态交换
+- **`tools/mtmd/clip.cpp`**：`clip_gpu_upload()` / `clip_gpu_download()` 实现 mmproj 权重在 GPU/CPU 间的上传/下载；GPU swap 模式下初始化 CUDA backend 并将 mmproj 加载到 CPU
+- **`tools/mtmd/mtmd.cpp`**：将 `gpu_swap_mode` 从 `mtmd_context_params` 正确传递给 `clip_context_params`
+
+----
+
+<h2 id="官方-readme">官方 README</h2>
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 
