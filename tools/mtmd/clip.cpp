@@ -183,7 +183,9 @@ struct clip_ctx {
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
         }
-        if (ctx_params.use_gpu) {
+        if (ctx_params.use_gpu || ctx_params.gpu_swap_mode) {
+            // Initialize GPU backend even when use_gpu=false if gpu_swap_mode is enabled
+            // This is needed so the scheduler knows about the GPU backend for dynamic swap
             auto backend_name = std::getenv("MTMD_BACKEND_DEVICE");
             if (backend_name != nullptr) {
                 backend = ggml_backend_init_by_name(backend_name, nullptr);
@@ -3899,27 +3901,25 @@ bool clip_gpu_upload(struct clip_ctx * ctx) {
     if (!ctx || !ctx->gpu_swap_mode) return false;
     if (ctx->buf_gpu) return true; // already on GPU
 
-    // Find CUDA backend for GPU upload
-    ggml_backend_t cuda_backend = nullptr;
-    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
-        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
-        const char *       reg_name = ggml_backend_reg_name(reg);
-        if (std::string(reg_name) == "CPU") {
-            continue;
-        }
-        // Check if this is a CUDA or GPU backend
-        if (strstr(reg_name, "CUDA") || strstr(reg_name, "cuda")) {
-            cuda_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
-            break;
-        }
-    }
-
-    if (!cuda_backend) {
-        LOG_WRN("clip_gpu_upload: no CUDA backend found, cannot upload to GPU\n");
+    // Use the clip_ctx's own backend (initialized during clip_init)
+    // This must be a GPU backend for upload to work
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        LOG_ERR("clip_gpu_upload: backend is CPU, no GPU to upload to\n");
         return false;
     }
 
-    ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(cuda_backend);
+    LOG_INF("clip_gpu_upload: using backend '%s' for GPU upload\n", ggml_backend_name(ctx->backend));
+
+    ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(ctx->backend);
+
+    // Log free VRAM before allocation attempt
+    ggml_backend_dev_t gpu_dev = ggml_backend_get_device(ctx->backend);
+    if (gpu_dev) {
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(gpu_dev, &props);
+        LOG_INF("clip_gpu_upload: GPU device VRAM: total=%zu MiB, free=%zu MiB\n",
+                props.memory_total / 1024 / 1024, props.memory_free / 1024 / 1024);
+    }
 
     // Calculate total size needed for GPU buffer with alignment
     size_t total_size = 0;
@@ -3933,10 +3933,14 @@ bool clip_gpu_upload(struct clip_ctx * ctx) {
         total_size = aligned_offset + ggml_nbytes(t);
     }
 
+    LOG_INF("clip_gpu_upload: total_size needed=%zu MiB (%zu bytes), n_tensors=%zu\n",
+            total_size / 1024 / 1024, total_size, tensor_offsets.size());
+
     // Allocate GPU buffer
     ggml_backend_buffer_t gpu_buf = ggml_backend_buft_alloc_buffer(gpu_buft, total_size);
     if (!gpu_buf) {
-        LOG_ERR("clip_gpu_upload: failed to allocate GPU buffer (%zu bytes)\n", total_size);
+        LOG_ERR("clip_gpu_upload: failed to allocate GPU buffer (%zu bytes = %zu MiB)\n",
+                total_size, total_size / 1024 / 1024);
         return false;
     }
 

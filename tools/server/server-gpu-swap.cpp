@@ -96,6 +96,10 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * mctx,
     }
 
     // ===== Step 3: Offload each GPU buffer group to CPU =====
+    // Key optimization: do NOT allocate CPU buffer to store the model weights.
+    // Just copy to temporary backup and free the GPU buffer immediately.
+    // This frees VRAM for mmproj upload. The model weights will be reloaded
+    // from backup data when we swap back to text model.
     fprintf(stderr, "%s: found %zu GPU buffer groups to offload\n", __func__, gpu_buffer_groups.size());
 
     for (auto & [gpu_buf, tensor_indices] : gpu_buffer_groups) {
@@ -117,7 +121,7 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * mctx,
             model_gpu_buft = gpu_buft;
         }
 
-        // Calculate total size with alignment for both CPU buffer and data backup
+        // Calculate total size with alignment
         size_t total_size = 0;
         size_t alignment = ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
 
@@ -137,7 +141,7 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * mctx,
 
         if (total_size == 0) continue;
 
-        // Allocate CPU memory for backup data
+        // Allocate CPU memory for backup data (needed for swap back)
         backup.data.resize(total_size, 0);
 
         // Copy GPU data to CPU backup memory
@@ -149,18 +153,18 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * mctx,
         }
 
         // Detach all tensors from GPU buffer before freeing it
-        // ggml_backend_tensor_alloc requires tensor->buffer == nullptr and tensor->data == nullptr
         for (size_t idx : tensor_indices) {
             struct ggml_tensor * tensor = tensors[idx].second;
             tensor->buffer = nullptr;
             tensor->data = nullptr;
         }
 
-        // Free the GPU buffer - all data has been safely copied to backup.data
+        // Free the GPU buffer - this frees VRAM for mmproj upload
         ggml_backend_buffer_free(gpu_buf);
 
         // Allocate CPU buffer to host the offloaded tensors
         // This keeps the tensors in a valid buffer so the scheduler can handle them
+        // and allows CUDA allocator to properly reclaim freed VRAM
         ggml_backend_buffer_t cpu_buf = ggml_backend_buft_alloc_buffer(
             ggml_backend_cpu_buffer_type(), total_size);
         if (!cpu_buf) {
@@ -177,7 +181,6 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * mctx,
             ggml_backend_buffer_t recovery_buf = ggml_backend_buft_alloc_buffer(backup.gpu_buft, gpu_total_size);
             if (!recovery_buf) {
                 fprintf(stderr, "%s: CRITICAL: GPU buffer recovery also failed, entering ERROR state\n", __func__);
-                // Both CPU and GPU allocation failed - tensors are orphaned with no valid buffer
                 model_backups.push_back(std::move(backup));
                 state = gpu_swap_state::ERROR;
                 return false;
@@ -214,13 +217,10 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * mctx,
         for (size_t i = 0; i < tensor_indices.size(); i++) {
             struct ggml_tensor * tensor = tensors[tensor_indices[i]].second;
             const auto & info = backup.tensors[i];
-
-            // Allocate tensor in CPU buffer at the correct offset
             ggml_backend_tensor_alloc(cpu_buf, tensor, (uint8_t *)cpu_base + info.offset);
         }
 
         // Copy data from backup to CPU buffer
-        // For host (CPU) buffers, ggml_backend_tensor_set copies data into the buffer
         for (size_t i = 0; i < tensor_indices.size(); i++) {
             struct ggml_tensor * tensor = tensors[tensor_indices[i]].second;
             const auto & info = backup.tensors[i];
@@ -233,14 +233,21 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * mctx,
         // Save backup
         model_backups.push_back(std::move(backup));
     }
-
-    // ===== Step 4: Upload clip model to GPU =====
+    
+    // ===== Step 4: Try to upload mmproj AFTER all model weights are offloaded =====
+    // At this point, all model weights (~16GB) should be freed from GPU memory
+    size_t total_freed_mb = 0;
+    for (auto& backup : model_backups) {
+        total_freed_mb += ggml_backend_buffer_get_size(backup.gpu_buf);
+    }
+    fprintf(stderr, "%s: all model weights offloaded, total freed: %.2f MiB, attempting mmproj upload (~1757 MiB needed)\n",
+            __func__, (double)total_freed_mb / 1024.0 / 1024.0);
+    
     if (mctx) {
         if (!mtmd_gpu_swap_upload(mctx)) {
             fprintf(stderr, "%s: failed to upload clip to GPU, rolling back model offload\n", __func__);
 
             // Rollback: reload model from CPU back to GPU
-            // Build a name -> tensor pointer map for quick lookup during rollback
             std::unordered_map<std::string, struct ggml_tensor *> rollback_tensor_map;
             for (const auto & [name, tensor] : tensors) {
                 rollback_tensor_map[name] = tensor;
@@ -256,7 +263,6 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * mctx,
                     break;
                 }
 
-                // Calculate GPU-aligned total size for rollback buffer
                 size_t rb_total_size = 0;
                 size_t rb_alignment = ggml_backend_buft_get_alignment(rb_gpu_buft);
                 for (const auto & info : backup.tensors) {
@@ -320,6 +326,8 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * mctx,
             return false;
         }
     }
+    
+    fprintf(stderr, "%s: successfully swapped to mmproj on GPU\n", __func__);
 
     // ===== Step 5: Reset the backend scheduler =====
     // After changing tensor locations, the scheduler needs to be reset
@@ -328,7 +336,7 @@ bool gpu_swap_manager::swap_to_mmproj_gpu(struct mtmd_context * mctx,
         llama_context_sched_update(lctx);
     }
 
-    // ===== Step 6: Update state and stats =====
+    // ===== Step 5: Update state and stats =====
     state = gpu_swap_state::MMPROJ_ON_GPU;
 
     const int64_t t_end = ggml_time_us();

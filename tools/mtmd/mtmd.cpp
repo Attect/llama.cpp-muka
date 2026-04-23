@@ -208,6 +208,7 @@ struct mtmd_context {
             /* warmup            */ ctx_params.warmup,
             /* cb_eval           */ ctx_params.cb_eval,
             /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
+            /* gpu_swap_mode     */ ctx_params.gpu_swap_mode,
         };
 
         auto res = clip_init(mmproj_fname, ctx_clip_params);

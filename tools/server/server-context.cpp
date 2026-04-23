@@ -20,8 +20,9 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
-#include <memory>
+#include <fstream>
 #include <filesystem>
+#include <memory>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -750,15 +751,25 @@ private:
     }
 
     // load the model and initialize llama_context
-    // this may also be called to resume from sleeping state
-    bool load_model(common_params & params) {
-        bool is_resume = sleeping;
+// this may also be called to resume from sleeping state
+     bool load_model(common_params & params) {
+         bool is_resume = sleeping;
 
-        SRV_INF("loading model '%s'\n", params.model.path.c_str());
+         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
-        params_base = params;
+         params_base = params;
 
-        llama_init = common_init_from_params(params_base);
+         // IMPORTANT: Check mmproj_gpu_swap BEFORE creating context
+         // because n_parallel=1 must be set before KV Cache allocation
+         // to reduce GPU memory usage and leave room for mmproj swap
+         if (params_base.mmproj_gpu_swap && !params_base.mmproj.path.empty()) {
+             if (params_base.n_parallel > 1) {
+                 SRV_WRN("%s", "--mmproj-gpu-swap requires single slot, forcing n_parallel=1 before context creation\n");
+                 params_base.n_parallel = 1;
+             }
+         }
+
+         llama_init = common_init_from_params(params_base);
 
         model = llama_init->model();
         ctx   = llama_init->context();
@@ -827,25 +838,61 @@ private:
              mparams.image_max_tokens = params_base.image_max_tokens;
              mparams.media_marker     = get_media_marker();
 
-             // GPU swap mode: allow swapping mmproj between CPU and GPU to share VRAM with text model
+            // GPU swap mode: allow swapping mmproj between CPU and GPU to share VRAM with text model
+             // Only enable swap when model is too large to fit in VRAM with mmproj
+             bool need_gpu_swap = false;
              if (params_base.mmproj_gpu_swap) {
-                 mparams.gpu_swap_mode = true;
+                 // Check model type and size to determine if swap is needed
+                 char arch_buf[128] = {0};
+                 llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf));
+                 std::string arch(arch_buf);
 
-                 // Only enable swap manager if mmproj is on CPU (--no-mmproj-offload specified).
-                 // If mmproj_use_gpu is true (default), mmproj stays on GPU and no swap is needed.
-                gpu_swap = std::make_unique<gpu_swap_manager>();
-                gpu_swap->enabled = !params_base.mmproj_use_gpu;
+                 // Get model file size
+                 size_t model_size_bytes = 0;
+                 {
+                     std::ifstream ifs(params_base.model.path, std::ios::binary | std::ios::ate);
+                     if (ifs.is_open()) {
+                         model_size_bytes = ifs.tellg();
+                         ifs.close();
+                     }
+                 }
+                 double model_size_gb = static_cast<double>(model_size_bytes) / (1024.0 * 1024.0 * 1024.0);
 
-                 // GPU swap requires single slot to avoid concurrent GPU state conflicts
-                 if (params_base.n_parallel > 1) {
-                     SRV_WRN("%s", "--mmproj-gpu-swap requires single slot, forcing n_parallel=1\n");
-                     params_base.n_parallel = 1;
+                 // Determine if swap is needed based on model type and size
+                 // MOE models: threshold is 21GB
+                 // Dense models: threshold is 16GB
+                 bool is_moe = (arch.find("mamba") != std::string::npos || 
+                               arch.find("jamba") != std::string::npos ||
+                               arch.find("mixtral") != std::string::npos);
+                 
+                 if (is_moe && model_size_gb >= 21.0) {
+                     need_gpu_swap = true;
+                     SRV_INF("%s", "MOE model detected (%.2f GB), GPU swap enabled\n", model_size_gb);
+                 } else if (!is_moe && model_size_gb >= 16.0) {
+                     need_gpu_swap = true;
+                     SRV_INF("%s", "Dense model detected (%.2f GB), GPU swap enabled\n", model_size_gb);
+                 } else {
+                     SRV_INF("%s", "Model size (%.2f GB) fits in VRAM with mmproj, no swap needed\n", model_size_gb);
                  }
 
-                 if (gpu_swap->enabled) {
-                     SRV_INF("%s", "GPU swap mode enabled: mmproj on CPU, will swap with text model on GPU\n");
+                 if (need_gpu_swap) {
+                      mparams.gpu_swap_mode = true;
+                      
+                      // Force mmproj to load on CPU for swapping during inference
+                      // This allows the text model to use GPU memory, and mmproj will be
+                      // swapped to GPU only when image processing is needed
+                      mparams.use_gpu = false;
+
+gpu_swap = std::make_unique<gpu_swap_manager>();
+                       gpu_swap->enabled = true;
+
+                       // n_parallel was already forced to 1 before context creation
+
+                      SRV_INF("%s", "GPU swap mode enabled: mmproj on CPU (will swap to GPU for image processing)\n");
                  } else {
-                     SRV_INF("%s", "GPU swap mode enabled but mmproj already on GPU (no --no-mmproj-offload), skipping swap\n");
+                     // No swap needed - mmproj and model can coexist in VRAM
+                     mparams.gpu_swap_mode = false;
+                     SRV_INF("%s", "GPU swap disabled: model fits in VRAM with mmproj\n");
                  }
              }
 
