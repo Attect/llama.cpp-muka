@@ -725,15 +725,6 @@ private:
         mtmd_free(mctx);
         mctx = nullptr;
 
-        gpu_swap.reset();
-        mtmd_cache_ctx.reset();
-
-        for (server_slot & slot : slots) {
-            if (slot.can_speculate()) {
-                slot.spec.reset();
-            }
-        }
-
         llama_batch_free(batch);
     }
 
@@ -916,7 +907,7 @@ private:
             if (params_base.mmproj_gpu_swap) {
                 // Check model type and size to determine if swap is needed
                 char arch_buf[128] = {0};
-                llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf));
+                llama_model_meta_val_str(model_tgt, "general.architecture", arch_buf, sizeof(arch_buf));
                 std::string arch(arch_buf);
 
                 // Get model file size
@@ -2904,7 +2895,7 @@ private:
                         // process the image
                         size_t n_tokens_out = 0;
                         int32_t res = input_tokens.process_chunk(ctx_tgt, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out,
-                            gpu_swap.get(), mtmd_cache_ctx.get(), model);
+                            gpu_swap.get(), mtmd_cache_ctx.get(), model_tgt);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);

@@ -2582,4 +2582,3 @@ struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, co
     if (it == model->tensors_by_name.end()) return nullptr;
     return it->second;
 }
-}
