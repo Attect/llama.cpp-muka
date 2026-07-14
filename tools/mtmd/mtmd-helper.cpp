@@ -5,6 +5,8 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#include <wincodec.h>
+#include <shlwapi.h>
 #endif
 
 #include "mtmd.h"
@@ -478,6 +480,113 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
 
 } // namespace audio_helpers
 
+#ifdef _WIN32
+/**
+ * Fallback image loader using Windows Imaging Component (WIC).
+ * Supports WebP, HEIC, AVIF and other formats on Windows 10 1809+.
+ * Returns RGB buffer allocated with malloc() (compatible with stbi_image_free).
+ */
+static unsigned char * wic_load_from_memory(const unsigned char * buf, size_t len, int * nx, int * ny) {
+    if (len > UINT_MAX) {
+        LOG_ERR("wic_load_from_memory: buffer too large\n");
+        return nullptr;
+    }
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool need_uninit = SUCCEEDED(hr);
+
+    IWICImagingFactory * factory = nullptr;
+    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+        if (need_uninit) CoUninitialize();
+        return nullptr;
+    }
+
+    IStream * stream = SHCreateMemStream(buf, (UINT)len);
+    if (!stream) {
+        factory->Release();
+        if (need_uninit) CoUninitialize();
+        return nullptr;
+    }
+
+    IWICBitmapDecoder * decoder = nullptr;
+    hr = factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder);
+    stream->Release();
+    if (FAILED(hr)) {
+        factory->Release();
+        if (need_uninit) CoUninitialize();
+        return nullptr;
+    }
+
+    IWICBitmapFrameDecode * frame = nullptr;
+    hr = decoder->GetFrame(0, &frame);
+    decoder->Release();
+    if (FAILED(hr)) {
+        factory->Release();
+        if (need_uninit) CoUninitialize();
+        return nullptr;
+    }
+
+    UINT width = 0, height = 0;
+    hr = frame->GetSize(&width, &height);
+    if (FAILED(hr) || width == 0 || height == 0) {
+        frame->Release();
+        factory->Release();
+        if (need_uninit) CoUninitialize();
+        return nullptr;
+    }
+
+    IWICFormatConverter * converter = nullptr;
+    hr = factory->CreateFormatConverter(&converter);
+    if (FAILED(hr)) {
+        frame->Release();
+        factory->Release();
+        if (need_uninit) CoUninitialize();
+        return nullptr;
+    }
+
+    hr = converter->Initialize(
+        frame,
+        GUID_WICPixelFormat24bppRGB,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0,
+        WICBitmapPaletteTypeCustom);
+    frame->Release();
+    if (FAILED(hr)) {
+        converter->Release();
+        factory->Release();
+        if (need_uninit) CoUninitialize();
+        return nullptr;
+    }
+
+    size_t stride = width * 3;
+    size_t total = stride * height;
+    unsigned char * data = (unsigned char *)malloc(total);
+    if (!data) {
+        converter->Release();
+        factory->Release();
+        if (need_uninit) CoUninitialize();
+        return nullptr;
+    }
+
+    hr = converter->CopyPixels(nullptr, (UINT)stride, (UINT)total, data);
+    converter->Release();
+    factory->Release();
+    if (need_uninit) CoUninitialize();
+
+    if (FAILED(hr)) {
+        free(data);
+        return nullptr;
+    }
+
+    *nx = (int)width;
+    *ny = (int)height;
+    return data;
+}
+#endif // _WIN32
+
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
         std::vector<float> pcmf32;
@@ -499,7 +608,38 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigne
         int nx, ny, nc;
         auto * data = stbi_load_from_memory(buf, len, &nx, &ny, &nc, 3);
         if (!data) {
-            LOG_ERR("%s: failed to decode image bytes\n", __func__);
+            // Diagnostic: print first 16 bytes as hex to identify the actual format
+            char hex[49] = {0};
+            for (size_t k = 0; k < 16 && k < len; ++k) {
+                snprintf(hex + k * 3, 4, "%02x ", buf[k]);
+            }
+            LOG_ERR("%s: stbi failed: %s (len=%zu, header=%s)\n", __func__, stbi_failure_reason(), len, hex);
+
+#ifdef _WIN32
+            // Fallback: try Windows Imaging Component (supports WebP on Win10 1809+)
+            data = wic_load_from_memory(buf, len, &nx, &ny);
+            if (data) {
+                LOG_INF("%s: decoded image via WIC fallback (nx=%d, ny=%d)\n", __func__, nx, ny);
+                result = mtmd_bitmap_init(nx, ny, data);
+                free(data);
+                return result;
+            }
+            LOG_ERR("%s: WIC fallback also failed\n", __func__);
+#endif
+
+            // Detect common unsupported formats and give a clearer error
+            if (len >= 12 && memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WEBP", 4) == 0) {
+                LOG_ERR("%s: WebP decoding failed. Ensure Windows 10 version 1809 or later is installed.\n", __func__);
+            } else if (len >= 12 && memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "AVIF", 4) == 0) {
+                LOG_ERR("%s: AVIF decoding failed. Ensure the AV1 Video Extension is installed.\n", __func__);
+            } else if (len >= 4 && memcmp(buf, "\x00\x00\x00\x1c", 4) == 0 && len >= 16 && (
+                       memcmp(buf + 8, "ftyp", 4) == 0)) {
+                // HEIC/AVIF container (ISO Base Media File Format)
+                LOG_ERR("%s: HEIC/AVIF container decoding failed. Ensure the HEVC Video Extension is installed.\n", __func__);
+            } else if (len >= 5 && memcmp(buf, "<?xml", 5) == 0) {
+                LOG_ERR("%s: SVG images are not supported. "
+                        "Please convert the image to PNG or JPEG before sending.\n", __func__);
+            }
             return nullptr;
         }
         result = mtmd_bitmap_init(nx, ny, data);

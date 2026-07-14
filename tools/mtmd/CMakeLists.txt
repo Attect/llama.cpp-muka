@@ -60,6 +60,10 @@ target_include_directories(mtmd PRIVATE ../..)
 target_include_directories(mtmd PRIVATE ../../vendor)
 target_compile_features   (mtmd PRIVATE cxx_std_17)
 
+if(WIN32)
+    target_link_libraries(mtmd PRIVATE windowscodecs shlwapi)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties     (mtmd PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(mtmd PRIVATE LLAMA_BUILD)
