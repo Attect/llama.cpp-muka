@@ -1,66 +1,46 @@
 #include "mtmd-cache.h"
 
-#include "ggml.h"
-
-#include <fstream>
-#include <sstream>
-#include <cstring>
-#include <cstdio>
 #include <algorithm>
-#include <sys/stat.h>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <system_error>
 
 #ifdef _WIN32
+#   define WIN32_LEAN_AND_MEAN
+#   ifndef NOMINMAX
+#       define NOMINMAX
+#   endif
 #   include <windows.h>
-#   include <direct.h>
-#   include <io.h>
+#   include <process.h>
 #else
+#   include <fcntl.h>
 #   include <unistd.h>
 #endif
 
-#define MTMD_CACHE_LOG_INF(...)  fprintf(stderr, __VA_ARGS__)
-#define MTMD_CACHE_LOG_WRN(...)  fprintf(stderr, __VA_ARGS__)
-#define MTMD_CACHE_LOG_ERR(...)  fprintf(stderr, __VA_ARGS__)
-// Adapted from examples/gguf-hash/deps/sha256/ (Igor Pavlov, Public domain)
-// with rotate-bits macros inlined to avoid external dependency
-// ============================================================
+#define MTMD_CACHE_LOG_INF(...) fprintf(stderr, __VA_ARGS__)
+#define MTMD_CACHE_LOG_WRN(...) fprintf(stderr, __VA_ARGS__)
 
-#define SHA256_DIGEST_SIZE 32
+namespace fs = std::filesystem;
 
-struct sha256_t {
-    uint32_t state[8];
-    uint64_t count;
-    uint8_t  buffer[64];
+namespace {
+
+constexpr size_t SHA256_SIZE = 32;
+constexpr size_t CACHE_MAX_EMBEDDING_BYTES = size_t(2) * 1024 * 1024 * 1024;
+
+struct sha256_state {
+    uint32_t h[8];
+    uint64_t total_bytes;
+    uint8_t block[64];
+    size_t block_size;
 };
 
-// Cross-platform bit rotation macros
-#ifdef _MSC_VER
-#   include <stdlib.h>
-#   define SHA256_ROTR32(v, n) _rotr((v), (n))
-#else
-#   define SHA256_ROTR32(v, n) (((uint32_t)(v) >> (n)) | ((uint32_t)(v) << (32 - (n))))
-#endif
-
-static void sha256_init(sha256_t * p) {
-    p->state[0] = 0x6a09e667;
-    p->state[1] = 0xbb67ae85;
-    p->state[2] = 0x3c6ef372;
-    p->state[3] = 0xa54ff53a;
-    p->state[4] = 0x510e527f;
-    p->state[5] = 0x9b05688c;
-    p->state[6] = 0x1f83d9ab;
-    p->state[7] = 0x5be0cd19;
-    p->count = 0;
-}
-
-#define SHA256_S0(x) (SHA256_ROTR32(x, 2)  ^ SHA256_ROTR32(x,13) ^ SHA256_ROTR32(x, 22))
-#define SHA256_S1(x) (SHA256_ROTR32(x, 6)  ^ SHA256_ROTR32(x,11) ^ SHA256_ROTR32(x, 25))
-#define SHA256_s0(x) (SHA256_ROTR32(x, 7)  ^ SHA256_ROTR32(x,18) ^ ((x) >> 3))
-#define SHA256_s1(x) (SHA256_ROTR32(x,17)  ^ SHA256_ROTR32(x,19) ^ ((x) >> 10))
-
-#define SHA256_Ch(x,y,z) (z^(x&(y^z)))
-#define SHA256_Maj(x,y,z) ((x&y)|(z&(x|y)))
-
-static const uint32_t sha256_K[64] = {
+constexpr uint32_t SHA256_K[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
     0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
@@ -76,404 +56,417 @@ static const uint32_t sha256_K[64] = {
     0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
     0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 };
 
-static void sha256_transform(uint32_t * state, const uint32_t * data) {
-    uint32_t W[16];
-    uint32_t a, b, c, d, e, f, g, h;
-    unsigned j;
-
-    a = state[0]; b = state[1]; c = state[2]; d = state[3];
-    e = state[4]; f = state[5]; g = state[6]; h = state[7];
-
-    for (j = 0; j < 64; j += 16) {
-        // Rounds 0-15
-        W[0]  = data[0];  W[1]  = data[1];  W[2]  = data[2];  W[3]  = data[3];
-        W[4]  = data[4];  W[5]  = data[5];  W[6]  = data[6];  W[7]  = data[7];
-        W[8]  = data[8];  W[9]  = data[9];  W[10] = data[10]; W[11] = data[11];
-        W[12] = data[12]; W[13] = data[13]; W[14] = data[14]; W[15] = data[15];
-
-        for (unsigned i = 0; i < 16; i++) {
-            uint32_t t = h + SHA256_S1(e) + SHA256_Ch(e,f,g) + sha256_K[j+i] + W[i&15];
-            d += t; t += SHA256_S0(a) + SHA256_Maj(a,b,c);
-            h = g; g = f; f = e; e = d; d = c; c = b; b = a; a = t;
-        }
-    }
-
-    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
-    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+static uint32_t rotr32(uint32_t value, unsigned bits) {
+    return (value >> bits) | (value << (32 - bits));
 }
 
-// Undefine internal macros to avoid polluting the namespace
-#undef SHA256_S0
-#undef SHA256_S1
-#undef SHA256_s0
-#undef SHA256_s1
-#undef SHA256_Ch
-#undef SHA256_Maj
-#undef SHA256_ROTR32
-
-static void sha256_write_byte_block(sha256_t * p) {
-    uint32_t data32[16];
-    for (unsigned i = 0; i < 16; i++) {
-        data32[i] =
-            ((uint32_t)(p->buffer[i * 4    ]) << 24) +
-            ((uint32_t)(p->buffer[i * 4 + 1]) << 16) +
-            ((uint32_t)(p->buffer[i * 4 + 2]) <<  8) +
-            ((uint32_t)(p->buffer[i * 4 + 3]));
-    }
-    sha256_transform(p->state, data32);
+static void sha256_init(sha256_state & state) {
+    state.h[0] = 0x6a09e667;
+    state.h[1] = 0xbb67ae85;
+    state.h[2] = 0x3c6ef372;
+    state.h[3] = 0xa54ff53a;
+    state.h[4] = 0x510e527f;
+    state.h[5] = 0x9b05688c;
+    state.h[6] = 0x1f83d9ab;
+    state.h[7] = 0x5be0cd19;
+    state.total_bytes = 0;
+    state.block_size = 0;
 }
 
-static void sha256_update(sha256_t * p, const uint8_t * data, size_t size) {
-    uint32_t curBufferPos = (uint32_t)(p->count & 0x3F);
+static void sha256_transform(sha256_state & state, const uint8_t block[64]) {
+    uint32_t w[64];
+    for (size_t i = 0; i < 16; ++i) {
+        w[i] = (uint32_t(block[i * 4 + 0]) << 24) |
+               (uint32_t(block[i * 4 + 1]) << 16) |
+               (uint32_t(block[i * 4 + 2]) << 8) |
+               uint32_t(block[i * 4 + 3]);
+    }
+    for (size_t i = 16; i < 64; ++i) {
+        const uint32_t s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        const uint32_t s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    uint32_t a = state.h[0];
+    uint32_t b = state.h[1];
+    uint32_t c = state.h[2];
+    uint32_t d = state.h[3];
+    uint32_t e = state.h[4];
+    uint32_t f = state.h[5];
+    uint32_t g = state.h[6];
+    uint32_t h = state.h[7];
+
+    for (size_t i = 0; i < 64; ++i) {
+        const uint32_t s1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+        const uint32_t ch = (e & f) ^ (~e & g);
+        const uint32_t temp1 = h + s1 + ch + SHA256_K[i] + w[i];
+        const uint32_t s0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+        const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        const uint32_t temp2 = s0 + maj;
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 + temp2;
+    }
+
+    state.h[0] += a;
+    state.h[1] += b;
+    state.h[2] += c;
+    state.h[3] += d;
+    state.h[4] += e;
+    state.h[5] += f;
+    state.h[6] += g;
+    state.h[7] += h;
+}
+
+static void sha256_update(sha256_state & state, const uint8_t * data, size_t size) {
+    if (!data && size != 0) {
+        return;
+    }
+
+    state.total_bytes += size;
     while (size > 0) {
-        p->buffer[curBufferPos++] = *data++;
-        p->count++;
-        size--;
-        if (curBufferPos == 64) {
-            curBufferPos = 0;
-            sha256_write_byte_block(p);
+        const size_t to_copy = std::min(size, sizeof(state.block) - state.block_size);
+        memcpy(state.block + state.block_size, data, to_copy);
+        state.block_size += to_copy;
+        data += to_copy;
+        size -= to_copy;
+
+        if (state.block_size == sizeof(state.block)) {
+            sha256_transform(state, state.block);
+            state.block_size = 0;
         }
     }
 }
 
-static void sha256_final(sha256_t * p, uint8_t * digest) {
-    uint64_t lenInBits = (p->count << 3);
-    uint32_t curBufferPos = (uint32_t)(p->count & 0x3F);
+static std::array<uint8_t, SHA256_SIZE> sha256_final(sha256_state & state) {
+    const uint64_t total_bits = state.total_bytes * 8;
+    state.block[state.block_size++] = 0x80;
 
-    p->buffer[curBufferPos++] = 0x80;
-    while (curBufferPos != (64 - 8)) {
-        curBufferPos &= 0x3F;
-        if (curBufferPos == 0) {
-            sha256_write_byte_block(p);
-        }
-        p->buffer[curBufferPos++] = 0;
+    if (state.block_size > 56) {
+        memset(state.block + state.block_size, 0, sizeof(state.block) - state.block_size);
+        sha256_transform(state, state.block);
+        state.block_size = 0;
     }
-    for (unsigned i = 0; i < 8; i++) {
-        p->buffer[curBufferPos++] = (uint8_t)(lenInBits >> 56);
-        lenInBits <<= 8;
-    }
-    sha256_write_byte_block(p);
 
-    for (unsigned i = 0; i < 8; i++) {
-        *digest++ = (uint8_t)(p->state[i] >> 24);
-        *digest++ = (uint8_t)(p->state[i] >> 16);
-        *digest++ = (uint8_t)(p->state[i] >> 8);
-        *digest++ = (uint8_t)(p->state[i]);
+    memset(state.block + state.block_size, 0, 56 - state.block_size);
+    for (size_t i = 0; i < 8; ++i) {
+        state.block[56 + i] = uint8_t(total_bits >> (56 - 8 * i));
     }
-    sha256_init(p);
+    sha256_transform(state, state.block);
+
+    std::array<uint8_t, SHA256_SIZE> digest{};
+    for (size_t i = 0; i < 8; ++i) {
+        digest[i * 4 + 0] = uint8_t(state.h[i] >> 24);
+        digest[i * 4 + 1] = uint8_t(state.h[i] >> 16);
+        digest[i * 4 + 2] = uint8_t(state.h[i] >> 8);
+        digest[i * 4 + 3] = uint8_t(state.h[i]);
+    }
+    return digest;
 }
 
-static void sha256_hash(uint8_t * buf, const uint8_t * data, size_t size) {
-    sha256_t hash;
-    sha256_init(&hash);
-    sha256_update(&hash, data, size);
-    sha256_final(&hash, buf);
-}
-
-// ============================================================
-// Utility: convert raw SHA-256 digest to hex string
-// ============================================================
-
-static std::string sha256_to_hex(const uint8_t * digest) {
-    static const char hex_chars[] = "0123456789abcdef";
+static std::string digest_to_hex(const std::array<uint8_t, SHA256_SIZE> & digest) {
+    static constexpr char HEX[] = "0123456789abcdef";
     std::string result;
-    result.reserve(SHA256_DIGEST_SIZE * 2);
-    for (int i = 0; i < SHA256_DIGEST_SIZE; i++) {
-        result.push_back(hex_chars[(digest[i] >> 4) & 0x0F]);
-        result.push_back(hex_chars[digest[i] & 0x0F]);
+    result.resize(SHA256_SIZE * 2);
+    for (size_t i = 0; i < digest.size(); ++i) {
+        result[i * 2 + 0] = HEX[digest[i] >> 4];
+        result[i * 2 + 1] = HEX[digest[i] & 0x0f];
     }
     return result;
 }
 
-// ============================================================
-// Utility: cross-platform directory creation
-// Copied from tools/rpc/rpc-server.cpp (avoids dependency on libcommon)
-// ============================================================
-
-#ifdef _WIN32
-// UTF-8 to wide string conversion for Windows API calls
-static std::wstring mtmd_utf8_to_wstring(const std::string & str) {
-    if (str.empty()) return std::wstring();
-    int size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0);
-    if (size <= 0) return std::wstring();
-    std::wstring result(size, 0);
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &result[0], size);
-    return result;
+static fs::path utf8_path(const std::string & path) {
+    return fs::u8path(path);
 }
-#endif
 
-static bool mtmd_create_directory_with_parents(const std::string & path) {
+static void append_u32_le(std::string & out, uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i) {
+        out.push_back(char(value >> (8 * i)));
+    }
+}
+
+static void append_u64_le(std::string & out, uint64_t value) {
+    for (unsigned i = 0; i < 8; ++i) {
+        out.push_back(char(value >> (8 * i)));
+    }
+}
+
+static void append_sized_string(std::string & out, const std::string & value) {
+    append_u64_le(out, value.size());
+    out.append(value);
+}
+
+static bool checked_embedding_size(
+        uint32_t n_tokens,
+        uint32_t n_embd,
+        size_t & n_values,
+        size_t & n_bytes) {
+    if (n_tokens == 0 || n_embd == 0 ||
+        size_t(n_tokens) > SIZE_MAX / size_t(n_embd)) {
+        return false;
+    }
+    n_values = size_t(n_tokens) * size_t(n_embd);
+    if (n_values > SIZE_MAX / sizeof(float)) {
+        return false;
+    }
+    n_bytes = n_values * sizeof(float);
+    return n_bytes <= CACHE_MAX_EMBEDDING_BYTES;
+}
+
+static uint64_t process_id() {
 #ifdef _WIN32
-    std::wstring wpath = mtmd_utf8_to_wstring(path);
-
-    // If the path already exists, check whether it's a directory
-    const DWORD attributes = GetFileAttributesW(wpath.c_str());
-    if ((attributes != INVALID_FILE_ATTRIBUTES) && (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
-        return true;
-    }
-
-    size_t pos_slash = 0;
-
-    // Process path from front to back, procedurally creating directories
-    // Handle both '\\' and '/' as path separators on Windows
-    while (true) {
-        size_t pos_bs = path.find('\\', pos_slash);
-        size_t pos_fs = path.find('/', pos_slash);
-        size_t next_sep;
-        if (pos_bs == std::string::npos && pos_fs == std::string::npos) {
-            break;
-        } else if (pos_bs == std::string::npos) {
-            next_sep = pos_fs;
-        } else if (pos_fs == std::string::npos) {
-            next_sep = pos_bs;
-        } else {
-            next_sep = (std::min)(pos_bs, pos_fs);
-        }
-
-        const std::wstring subpath = wpath.substr(0, next_sep);
-        pos_slash = next_sep + 1;
-
-        // Skip the drive letter, in some systems it can return an access denied error
-        if (subpath.length() == 2 && subpath[1] == L':') {
-            continue;
-        }
-
-        const BOOL success = CreateDirectoryW(subpath.c_str(), NULL);
-        if (!success) {
-            const DWORD error = GetLastError();
-            if (error == ERROR_ALREADY_EXISTS) {
-                const DWORD attr = GetFileAttributesW(subpath.c_str());
-                if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-    }
-
-    return true;
+    return uint64_t(_getpid());
 #else
-    // If the path already exists, check whether it's a directory
-    struct stat info;
-    if (stat(path.c_str(), &info) == 0) {
-        return S_ISDIR(info.st_mode);
-    }
-
-    size_t pos_slash = 1; // Skip leading slashes for directory creation
-
-    // Process path from front to back, procedurally creating directories
-    while ((pos_slash = path.find('/', pos_slash)) != std::string::npos) {
-        const std::string subpath = path.substr(0, pos_slash);
-        struct stat st_info;
-
-        if (stat(subpath.c_str(), &st_info) == 0) {
-            if (!S_ISDIR(st_info.st_mode)) {
-                return false;
-            }
-        } else {
-            const int ret = mkdir(subpath.c_str(), 0755);
-            if (ret != 0) {
-                return false;
-            }
-        }
-
-        pos_slash += 1;
-    }
-
-    return true;
+    return uint64_t(getpid());
 #endif
 }
 
-// ============================================================
-// mtmd_cache implementation
-// ============================================================
+} // namespace
 
-std::string mtmd_cache::compute_data_sha256(const uint8_t * data, size_t size) {
-    uint8_t digest[SHA256_DIGEST_SIZE];
-    sha256_hash(digest, data, size);
-    return sha256_to_hex(digest);
+std::string mtmd_cache_sha256(const uint8_t * data, size_t size) {
+    if (!data && size != 0) {
+        return {};
+    }
+    sha256_state state;
+    sha256_init(state);
+    sha256_update(state, data, size);
+    return digest_to_hex(sha256_final(state));
 }
 
 std::string mtmd_cache::compute_file_sha256(const std::string & path) {
-    // Read file in chunks to handle large mmproj models without excessive memory use
-    static const size_t CHUNK_SIZE = 1024 * 1024; // 1 MiB
-
-#ifdef _WIN32
-    std::wstring wpath = mtmd_utf8_to_wstring(path);
-    FILE * file = _wfopen(wpath.c_str(), L"rb");
-#else
-    FILE * file = fopen(path.c_str(), "rb");
-#endif
-    if (!file) {
-        MTMD_CACHE_LOG_WRN("%s: failed to open file for SHA-256: %s\n", __func__, path.c_str());
-        return "";
+    std::ifstream file(utf8_path(path), std::ios::binary);
+    if (!file.is_open()) {
+        return {};
     }
 
-    sha256_t ctx;
-    sha256_init(&ctx);
-
-    std::vector<uint8_t> chunk(CHUNK_SIZE);
-    size_t bytes_read;
-    while ((bytes_read = fread(chunk.data(), 1, CHUNK_SIZE, file)) > 0) {
-        sha256_update(&ctx, chunk.data(), bytes_read);
+    sha256_state state;
+    sha256_init(state);
+    std::array<uint8_t, 64 * 1024> chunk{};
+    while (file) {
+        file.read(reinterpret_cast<char *>(chunk.data()), chunk.size());
+        const std::streamsize count = file.gcount();
+        if (count > 0) {
+            sha256_update(state, chunk.data(), size_t(count));
+        }
     }
-    fclose(file);
-
-    uint8_t digest[SHA256_DIGEST_SIZE];
-    sha256_final(&ctx, digest);
-    return sha256_to_hex(digest);
+    if (!file.eof()) {
+        return {};
+    }
+    return digest_to_hex(sha256_final(state));
 }
 
 std::string mtmd_cache::compute_cache_key(
-    const uint8_t * image_data, size_t image_data_size,
-    uint32_t nx, uint32_t ny,
-    mtmd_projector_type proj_type) const {
-
-    // Build composite input: mmproj_hash + image_hash + nx + ny + proj_type
-    // This ensures cache invalidation when the mmproj model changes,
-    // the image data changes, or tokenization parameters change
-    std::string input;
-    input += mmproj_hash;
-    input += compute_data_sha256(image_data, image_data_size);
-    input.append(reinterpret_cast<const char *>(&nx), sizeof(nx));
-    input.append(reinterpret_cast<const char *>(&ny), sizeof(ny));
-    int32_t pt = static_cast<int32_t>(proj_type);
-    input.append(reinterpret_cast<const char *>(&pt), sizeof(pt));
-
-    return compute_data_sha256(reinterpret_cast<const uint8_t *>(input.data()), input.size());
+        const uint8_t * image_data,
+        size_t image_data_size,
+        uint32_t nx,
+        uint32_t ny,
+        mtmd_projector_type proj_type) const {
+    const std::string image_hash = mtmd_cache_sha256(image_data, image_data_size);
+    if (image_hash.empty() && image_data_size != 0) {
+        return {};
+    }
+    return compute_cache_key_from_hash(image_hash, nx, ny, proj_type);
 }
 
 std::string mtmd_cache::compute_cache_key_from_hash(
-    const std::string & image_hash,
-    uint32_t nx, uint32_t ny,
-    mtmd_projector_type proj_type) const {
-
-    // Same as compute_cache_key but uses a pre-computed hash instead of raw image data
-    // The image_hash is expected to be a unique identifier for the image content
-    // (e.g., FNV hash of raw bitmap data computed during tokenization)
-    std::string input;
-    input += mmproj_hash;
-    input += image_hash;
-    input.append(reinterpret_cast<const char *>(&nx), sizeof(nx));
-    input.append(reinterpret_cast<const char *>(&ny), sizeof(ny));
-    int32_t pt = static_cast<int32_t>(proj_type);
-    input.append(reinterpret_cast<const char *>(&pt), sizeof(pt));
-
-    return compute_data_sha256(reinterpret_cast<const uint8_t *>(input.data()), input.size());
+        const std::string & image_hash,
+        uint32_t nx,
+        uint32_t ny,
+        mtmd_projector_type proj_type) const {
+    std::string input("mtmd-cache-key-v1", 17);
+    append_sized_string(input, mmproj_hash);
+    append_sized_string(input, image_hash);
+    append_u32_le(input, nx);
+    append_u32_le(input, ny);
+    append_u32_le(input, static_cast<uint32_t>(proj_type));
+    return mtmd_cache_sha256(reinterpret_cast<const uint8_t *>(input.data()), input.size());
 }
 
-bool mtmd_cache::init(const std::string & cache_dir_, const std::string & mmproj_path) {
+bool mtmd_cache::init(const std::string & cache_dir_in, const std::string & mmproj_path) {
+    std::lock_guard<std::mutex> lock(mtx);
     enabled = false;
+    cache_dir.clear();
+    mmproj_hash.clear();
 
-    // Compute mmproj file hash first — this is required regardless of directory creation
-    mmproj_hash = compute_file_sha256(mmproj_path);
-    if (mmproj_hash.empty()) {
-        MTMD_CACHE_LOG_WRN("%s: failed to compute mmproj SHA-256, cache disabled\n", __func__);
+    if (cache_dir_in.empty() || mmproj_path.empty()) {
         return false;
     }
 
-    MTMD_CACHE_LOG_INF("%s: mmproj hash: %s\n", __func__, mmproj_hash.c_str());
-
-    // Create cache directory (including parents) if it doesn't exist
-    if (!mtmd_create_directory_with_parents(cache_dir_)) {
-        MTMD_CACHE_LOG_WRN("%s: failed to create cache directory: %s\n", __func__, cache_dir_.c_str());
+    const std::string hash = compute_file_sha256(mmproj_path);
+    if (hash.empty()) {
+        MTMD_CACHE_LOG_WRN("%s: failed to compute mmproj SHA-256\n", __func__);
         return false;
     }
 
-    cache_dir = cache_dir_;
+    std::error_code ec;
+    const fs::path dir = utf8_path(cache_dir_in);
+    fs::create_directories(dir, ec);
+    if (ec || !fs::is_directory(dir, ec) || ec) {
+        MTMD_CACHE_LOG_WRN("%s: failed to create cache directory: %s\n", __func__, cache_dir_in.c_str());
+        return false;
+    }
+
+    cache_dir = cache_dir_in;
+    mmproj_hash = hash;
     enabled = true;
-
-    MTMD_CACHE_LOG_INF("%s: image tokenization cache enabled at: %s\n", __func__, cache_dir.c_str());
+    MTMD_CACHE_LOG_INF("%s: cache enabled at %s (mmproj %s)\n",
+        __func__, cache_dir.c_str(), mmproj_hash.substr(0, 12).c_str());
     return true;
 }
 
-bool mtmd_cache::lookup(const uint8_t * image_data, size_t image_data_size,
-                         uint32_t nx, uint32_t ny,
-                         mtmd_projector_type proj_type,
-                         std::vector<float> & embd,
-                         uint32_t & n_tokens, uint32_t & n_embd,
-                         bool & use_mrope_pos) {
-    if (!enabled) {
+bool mtmd_cache::lookup(
+        const uint8_t * image_data,
+        size_t image_data_size,
+        uint32_t nx,
+        uint32_t ny,
+        mtmd_projector_type proj_type,
+        std::vector<float> & embd,
+        uint32_t & n_tokens,
+        uint32_t & n_embd,
+        bool & use_mrope_pos) {
+    const std::string key = compute_cache_key(image_data, image_data_size, nx, ny, proj_type);
+    if (key.empty()) {
         return false;
     }
-
     std::lock_guard<std::mutex> lock(mtx);
+    return enabled && lookup_key(key, nx, ny, embd, n_tokens, n_embd, use_mrope_pos);
+}
 
-    std::string key = compute_cache_key(image_data, image_data_size, nx, ny, proj_type);
-    std::string path = cache_dir + "/" + key + ".bin";
+bool mtmd_cache::store(
+        const uint8_t * image_data,
+        size_t image_data_size,
+        uint32_t nx,
+        uint32_t ny,
+        mtmd_projector_type proj_type,
+        const float * embd,
+        uint32_t n_tokens,
+        uint32_t n_embd,
+        bool use_mrope_pos) {
+    const std::string key = compute_cache_key(image_data, image_data_size, nx, ny, proj_type);
+    if (key.empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    return enabled && store_key(key, nx, ny, embd, n_tokens, n_embd, use_mrope_pos);
+}
 
-#ifdef _WIN32
-    std::wstring wpath = mtmd_utf8_to_wstring(path);
-    std::ifstream file(wpath, std::ios::binary);
-#else
+bool mtmd_cache::lookup_by_hash(
+        const std::string & image_hash,
+        uint32_t nx,
+        uint32_t ny,
+        mtmd_projector_type proj_type,
+        std::vector<float> & embd,
+        uint32_t & n_tokens,
+        uint32_t & n_embd,
+        bool & use_mrope_pos) {
+    if (image_hash.empty()) {
+        return false;
+    }
+    const std::string key = compute_cache_key_from_hash(image_hash, nx, ny, proj_type);
+    std::lock_guard<std::mutex> lock(mtx);
+    return enabled && lookup_key(key, nx, ny, embd, n_tokens, n_embd, use_mrope_pos);
+}
+
+bool mtmd_cache::store_by_hash(
+        const std::string & image_hash,
+        uint32_t nx,
+        uint32_t ny,
+        mtmd_projector_type proj_type,
+        const float * embd,
+        uint32_t n_tokens,
+        uint32_t n_embd,
+        bool use_mrope_pos) {
+    if (image_hash.empty()) {
+        return false;
+    }
+    const std::string key = compute_cache_key_from_hash(image_hash, nx, ny, proj_type);
+    std::lock_guard<std::mutex> lock(mtx);
+    return enabled && store_key(key, nx, ny, embd, n_tokens, n_embd, use_mrope_pos);
+}
+
+bool mtmd_cache::lookup_key(
+        const std::string & key,
+        uint32_t nx,
+        uint32_t ny,
+        std::vector<float> & embd,
+        uint32_t & n_tokens,
+        uint32_t & n_embd,
+        bool & use_mrope_pos) {
+    const fs::path path = utf8_path(cache_dir) / (key + ".bin");
     std::ifstream file(path, std::ios::binary);
-#endif
     if (!file.is_open()) {
-        return false; // Cache miss — normal case, no warning needed
+        return false;
     }
 
-    // Read and validate header
-    mtmd_cache_header header;
+    auto reject = [&](const char * reason) {
+        MTMD_CACHE_LOG_WRN("%s: rejecting %s: %s\n", __func__, path.string().c_str(), reason);
+        file.close();
+        std::error_code remove_ec;
+        fs::remove(path, remove_ec);
+        embd.clear();
+        return false;
+    };
+
+    mtmd_cache_header header{};
     if (!file.read(reinterpret_cast<char *>(&header), sizeof(header))) {
-        MTMD_CACHE_LOG_WRN("%s: failed to read cache header: %s\n", __func__, path.c_str());
-        return false;
+        return reject("truncated header");
+    }
+    if (header.magic != MTMD_CACHE_MAGIC || header.version != MTMD_CACHE_VERSION) {
+        return reject("invalid magic or version");
+    }
+    if (header.nx != nx || header.ny != ny || header.use_mrope_pos > 1) {
+        return reject("metadata mismatch");
     }
 
-    if (header.magic != MTMD_CACHE_MAGIC) {
-        MTMD_CACHE_LOG_WRN("%s: invalid cache magic in %s\n", __func__, path.c_str());
-        return false;
+    size_t n_values = 0;
+    size_t n_bytes = 0;
+    if (!checked_embedding_size(header.n_tokens, header.n_embd, n_values, n_bytes)) {
+        return reject("invalid embedding dimensions");
     }
 
-    if (header.version != MTMD_CACHE_VERSION) {
-        MTMD_CACHE_LOG_WRN("%s: cache version mismatch (expected %u, got %u) in %s\n",
-                __func__, MTMD_CACHE_VERSION, header.version, path.c_str());
-        return false;
+    std::error_code size_ec;
+    const uintmax_t file_size = fs::file_size(path, size_ec);
+    if (size_ec || file_size != sizeof(header) + uintmax_t(n_bytes)) {
+        return reject("unexpected file size");
     }
 
-    // Validate dimensions to guard against corrupted cache files
-    if (header.n_tokens == 0 || header.n_embd == 0) {
-        MTMD_CACHE_LOG_WRN("%s: invalid cache dimensions (n_tokens=%u, n_embd=%u) in %s\n",
-                __func__, header.n_tokens, header.n_embd, path.c_str());
-        return false;
-    }
-
-    // Read embedding data
-    size_t embd_size = (size_t)header.n_tokens * header.n_embd;
-    embd.resize(embd_size);
-    if (!file.read(reinterpret_cast<char *>(embd.data()), embd_size * sizeof(float))) {
-        MTMD_CACHE_LOG_WRN("%s: failed to read cache embedding data: %s\n", __func__, path.c_str());
-        return false;
+    embd.resize(n_values);
+    if (!file.read(reinterpret_cast<char *>(embd.data()), std::streamsize(n_bytes))) {
+        return reject("truncated embedding payload");
     }
 
     n_tokens = header.n_tokens;
     n_embd = header.n_embd;
     use_mrope_pos = header.use_mrope_pos != 0;
-
-    MTMD_CACHE_LOG_INF("%s: cache hit: %s (n_tokens=%u, n_embd=%u)\n",
-            __func__, key.substr(0, 12).c_str(), n_tokens, n_embd);
+    MTMD_CACHE_LOG_INF("%s: cache hit %s (%u x %u)\n",
+        __func__, key.substr(0, 12).c_str(), n_tokens, n_embd);
     return true;
 }
 
-bool mtmd_cache::store(const uint8_t * image_data, size_t image_data_size,
-                        uint32_t nx, uint32_t ny,
-                        mtmd_projector_type proj_type,
-                        const float * embd,
-                        uint32_t n_tokens, uint32_t n_embd,
-                        bool use_mrope_pos) {
-    if (!enabled) {
+bool mtmd_cache::store_key(
+        const std::string & key,
+        uint32_t nx,
+        uint32_t ny,
+        const float * embd,
+        uint32_t n_tokens,
+        uint32_t n_embd,
+        bool use_mrope_pos) {
+    size_t n_values = 0;
+    size_t n_bytes = 0;
+    if (!embd || !checked_embedding_size(n_tokens, n_embd, n_values, n_bytes)) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(mtx);
-
-    std::string key = compute_cache_key(image_data, image_data_size, nx, ny, proj_type);
-    std::string path = cache_dir + "/" + key + ".bin";
-
-    mtmd_cache_header header;
+    mtmd_cache_header header{};
     header.magic = MTMD_CACHE_MAGIC;
     header.version = MTMD_CACHE_VERSION;
     header.n_tokens = n_tokens;
@@ -481,196 +474,87 @@ bool mtmd_cache::store(const uint8_t * image_data, size_t image_data_size,
     header.nx = nx;
     header.ny = ny;
     header.use_mrope_pos = use_mrope_pos ? 1 : 0;
-    header.reserved[0] = 0;
-    header.reserved[1] = 0;
-    header.reserved[2] = 0;
 
-    size_t embd_size = (size_t)n_tokens * n_embd;
-
-    if (!atomic_write_file(path, header, embd, embd_size * sizeof(float))) {
-        // Store failure should not affect inference — just log a warning
-        MTMD_CACHE_LOG_WRN("%s: failed to write cache file: %s\n", __func__, path.c_str());
+    const fs::path path = utf8_path(cache_dir) / (key + ".bin");
+    if (!atomic_write_file(path.u8string(), header, embd, n_bytes)) {
+        MTMD_CACHE_LOG_WRN("%s: failed to store %s\n", __func__, path.string().c_str());
         return false;
     }
 
-    MTMD_CACHE_LOG_INF("%s: cache stored: %s (n_tokens=%u, n_embd=%u, %.2f MiB)\n",
-            __func__, key.substr(0, 12).c_str(), n_tokens, n_embd,
-            (double)(embd_size * sizeof(float)) / (1024.0 * 1024.0));
+    MTMD_CACHE_LOG_INF("%s: cache stored %s (%u x %u, %.2f MiB)\n",
+        __func__, key.substr(0, 12).c_str(), n_tokens, n_embd, n_bytes / 1024.0 / 1024.0);
     return true;
 }
 
-bool mtmd_cache::atomic_write_file(const std::string & path,
-                                    const mtmd_cache_header & header,
-                                    const float * embd, size_t embd_size) {
-    // Write to a temporary file first, then atomically rename.
-    // This prevents readers from seeing a partially-written cache file.
-    std::string temp_path = path + ".tmp";
+bool mtmd_cache::atomic_write_file(
+        const std::string & path_string,
+        const mtmd_cache_header & header,
+        const float * embd,
+        size_t embd_bytes) {
+    static std::atomic<uint64_t> temp_counter{0};
+
+    const fs::path destination = utf8_path(path_string);
+    fs::path temporary = destination;
+    temporary += ".tmp." + std::to_string(process_id()) + "." +
+                 std::to_string(temp_counter.fetch_add(1, std::memory_order_relaxed));
+
+    auto remove_temporary = [&]() {
+        std::error_code ec;
+        fs::remove(temporary, ec);
+    };
 
     {
-#ifdef _WIN32
-        std::wstring wtemp_path = mtmd_utf8_to_wstring(temp_path);
-        std::ofstream file(wtemp_path, std::ios::binary);
-#else
-        std::ofstream file(temp_path, std::ios::binary);
-#endif
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) {
             return false;
         }
-
-        if (!file.write(reinterpret_cast<const char *>(&header), sizeof(header))) {
-            return false;
-        }
-
-        if (embd_size > 0 && embd) {
-            if (!file.write(reinterpret_cast<const char *>(embd), embd_size)) {
-                return false;
-            }
-        }
-
-        // Flush to disk before rename to ensure durability
+        file.write(reinterpret_cast<const char *>(&header), sizeof(header));
+        file.write(reinterpret_cast<const char *>(embd), std::streamsize(embd_bytes));
         file.flush();
         if (!file.good()) {
+            file.close();
+            remove_temporary();
             return false;
         }
     }
 
-    // Atomic rename: temp_path -> path
-    // On Windows, rename() cannot overwrite an existing file, so we must
-    // remove the destination first. This is safe because concurrent access
-    // is protected by the mutex in the calling lookup/store methods.
 #ifdef _WIN32
-    std::wstring wtemp = mtmd_utf8_to_wstring(temp_path);
-    std::wstring wdest = mtmd_utf8_to_wstring(path);
-
-    // If destination exists, remove it first
-    DWORD attrs = GetFileAttributesW(wdest.c_str());
-    if (attrs != INVALID_FILE_ATTRIBUTES) {
-        if (!DeleteFileW(wdest.c_str())) {
-            MTMD_CACHE_LOG_WRN("%s: failed to remove existing cache file: %s\n", __func__, path.c_str());
-            // Continue anyway — MoveFileEx may succeed
+    HANDLE handle = CreateFileW(
+        temporary.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        remove_temporary();
+        return false;
+    }
+    const BOOL flushed = FlushFileBuffers(handle);
+    CloseHandle(handle);
+    if (!flushed || !MoveFileExW(
+            temporary.c_str(), destination.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        remove_temporary();
+        return false;
+    }
+#else
+    const int fd = open(temporary.c_str(), O_RDONLY);
+    if (fd < 0 || fsync(fd) != 0) {
+        if (fd >= 0) {
+            close(fd);
         }
+        remove_temporary();
+        return false;
+    }
+    close(fd);
+    if (rename(temporary.c_str(), destination.c_str()) != 0) {
+        remove_temporary();
+        return false;
     }
 
-    if (!MoveFileExW(wtemp.c_str(), wdest.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        MTMD_CACHE_LOG_WRN("%s: failed to rename temp cache file: %s\n", __func__, path.c_str());
-        return false;
-    }
-#else
-    if (rename(temp_path.c_str(), path.c_str()) != 0) {
-        MTMD_CACHE_LOG_WRN("%s: failed to rename temp cache file: %s\n", __func__, path.c_str());
-        return false;
+    const int dir_fd = open(destination.parent_path().c_str(), O_RDONLY);
+    if (dir_fd >= 0) {
+        (void) fsync(dir_fd);
+        close(dir_fd);
     }
 #endif
 
-    return true;
-}
-
-// ============================================================
-// Hash-based cache lookup/store (for use when raw image data is not available)
-// ============================================================
-
-bool mtmd_cache::lookup_by_hash(const std::string & image_hash,
-                                 uint32_t nx, uint32_t ny,
-                                 mtmd_projector_type proj_type,
-                                 std::vector<float> & embd,
-                                 uint32_t & n_tokens, uint32_t & n_embd,
-                                 bool & use_mrope_pos) {
-    if (!enabled) {
-        return false;
-    }
-
-    std::lock_guard<std::mutex> lock(mtx);
-
-    std::string key = compute_cache_key_from_hash(image_hash, nx, ny, proj_type);
-    std::string path = cache_dir + "/" + key + ".bin";
-
-#ifdef _WIN32
-    std::wstring wpath = mtmd_utf8_to_wstring(path);
-    std::ifstream file(wpath, std::ios::binary);
-#else
-    std::ifstream file(path, std::ios::binary);
-#endif
-    if (!file.is_open()) {
-        return false; // Cache miss
-    }
-
-    // Read and validate header
-    mtmd_cache_header header;
-    if (!file.read(reinterpret_cast<char *>(&header), sizeof(header))) {
-        MTMD_CACHE_LOG_WRN("%s: failed to read cache header: %s\n", __func__, path.c_str());
-        return false;
-    }
-
-    if (header.magic != MTMD_CACHE_MAGIC) {
-        MTMD_CACHE_LOG_WRN("%s: invalid cache magic in %s\n", __func__, path.c_str());
-        return false;
-    }
-
-    if (header.version != MTMD_CACHE_VERSION) {
-        MTMD_CACHE_LOG_WRN("%s: cache version mismatch (expected %u, got %u) in %s\n",
-                __func__, MTMD_CACHE_VERSION, header.version, path.c_str());
-        return false;
-    }
-
-    if (header.n_tokens == 0 || header.n_embd == 0) {
-        MTMD_CACHE_LOG_WRN("%s: invalid cache dimensions (n_tokens=%u, n_embd=%u) in %s\n",
-                __func__, header.n_tokens, header.n_embd, path.c_str());
-        return false;
-    }
-
-    // Read embedding data
-    size_t embd_size = (size_t)header.n_tokens * header.n_embd;
-    embd.resize(embd_size);
-    if (!file.read(reinterpret_cast<char *>(embd.data()), embd_size * sizeof(float))) {
-        MTMD_CACHE_LOG_WRN("%s: failed to read cache embedding data: %s\n", __func__, path.c_str());
-        return false;
-    }
-
-    n_tokens = header.n_tokens;
-    n_embd = header.n_embd;
-    use_mrope_pos = header.use_mrope_pos != 0;
-
-    MTMD_CACHE_LOG_INF("%s: cache hit (by hash): %s (n_tokens=%u, n_embd=%u)\n",
-            __func__, key.substr(0, 12).c_str(), n_tokens, n_embd);
-    return true;
-}
-
-bool mtmd_cache::store_by_hash(const std::string & image_hash,
-                                uint32_t nx, uint32_t ny,
-                                mtmd_projector_type proj_type,
-                                const float * embd,
-                                uint32_t n_tokens, uint32_t n_embd,
-                                bool use_mrope_pos) {
-    if (!enabled) {
-        return false;
-    }
-
-    std::lock_guard<std::mutex> lock(mtx);
-
-    std::string key = compute_cache_key_from_hash(image_hash, nx, ny, proj_type);
-    std::string path = cache_dir + "/" + key + ".bin";
-
-    mtmd_cache_header header;
-    header.magic = MTMD_CACHE_MAGIC;
-    header.version = MTMD_CACHE_VERSION;
-    header.n_tokens = n_tokens;
-    header.n_embd = n_embd;
-    header.nx = nx;
-    header.ny = ny;
-    header.use_mrope_pos = use_mrope_pos ? 1 : 0;
-    header.reserved[0] = 0;
-    header.reserved[1] = 0;
-    header.reserved[2] = 0;
-
-    size_t embd_size = (size_t)n_tokens * n_embd;
-
-    if (!atomic_write_file(path, header, embd, embd_size * sizeof(float))) {
-        MTMD_CACHE_LOG_WRN("%s: failed to write cache file: %s\n", __func__, path.c_str());
-        return false;
-    }
-
-    MTMD_CACHE_LOG_INF("%s: cache stored (by hash): %s (n_tokens=%u, n_embd=%u, %.2f MiB)\n",
-            __func__, key.substr(0, 12).c_str(), n_tokens, n_embd,
-            (double)(embd_size * sizeof(float)) / (1024.0 * 1024.0));
     return true;
 }

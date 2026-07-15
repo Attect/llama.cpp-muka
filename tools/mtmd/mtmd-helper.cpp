@@ -14,6 +14,9 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cctype>
+#include <climits>
+#include <cstring>
 #include <cinttypes>
 #include <vector>
 
@@ -487,13 +490,17 @@ static bool decode_audio_from_buf(const unsigned char * buf_in, size_t len, int 
  * Returns RGB buffer allocated with malloc() (compatible with stbi_image_free).
  */
 static unsigned char * wic_load_from_memory(const unsigned char * buf, size_t len, int * nx, int * ny) {
-    if (len > UINT_MAX) {
-        LOG_ERR("wic_load_from_memory: buffer too large\n");
+    if (!buf || !nx || !ny || len == 0 || len > UINT_MAX) {
+        LOG_ERR("wic_load_from_memory: invalid input buffer\n");
         return nullptr;
     }
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    bool need_uninit = SUCCEEDED(hr);
+    const bool need_uninit = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        LOG_ERR("wic_load_from_memory: COM initialization failed (0x%08lx)\n", (unsigned long) hr);
+        return nullptr;
+    }
 
     IWICImagingFactory * factory = nullptr;
     hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
@@ -530,7 +537,13 @@ static unsigned char * wic_load_from_memory(const unsigned char * buf, size_t le
 
     UINT width = 0, height = 0;
     hr = frame->GetSize(&width, &height);
-    if (FAILED(hr) || width == 0 || height == 0) {
+    constexpr uint64_t MAX_DECODED_IMAGE_BYTES = uint64_t(1024) * 1024 * 1024;
+    const uint64_t stride64 = uint64_t(width) * 3;
+    const uint64_t total64 = stride64 * uint64_t(height);
+    if (FAILED(hr) || width == 0 || height == 0 ||
+        width > INT_MAX || height > INT_MAX ||
+        stride64 > UINT_MAX || total64 > UINT_MAX || total64 > MAX_DECODED_IMAGE_BYTES) {
+        LOG_ERR("wic_load_from_memory: invalid or oversized image dimensions (%u x %u)\n", width, height);
         frame->Release();
         factory->Release();
         if (need_uninit) CoUninitialize();
@@ -561,9 +574,9 @@ static unsigned char * wic_load_from_memory(const unsigned char * buf, size_t le
         return nullptr;
     }
 
-    size_t stride = width * 3;
-    size_t total = stride * height;
-    unsigned char * data = (unsigned char *)malloc(total);
+    const UINT stride = (UINT) stride64;
+    const UINT total = (UINT) total64;
+    unsigned char * data = (unsigned char *) malloc(total);
     if (!data) {
         converter->Release();
         factory->Release();
@@ -571,7 +584,7 @@ static unsigned char * wic_load_from_memory(const unsigned char * buf, size_t le
         return nullptr;
     }
 
-    hr = converter->CopyPixels(nullptr, (UINT)stride, (UINT)total, data);
+    hr = converter->CopyPixels(nullptr, stride, total, data);
     converter->Release();
     factory->Release();
     if (need_uninit) CoUninitialize();
@@ -586,6 +599,47 @@ static unsigned char * wic_load_from_memory(const unsigned char * buf, size_t le
     return data;
 }
 #endif // _WIN32
+
+static bool ascii_starts_with_ci(const unsigned char * data, size_t size, const char * literal) {
+    const size_t literal_size = strlen(literal);
+    if (size < literal_size) {
+        return false;
+    }
+    for (size_t i = 0; i < literal_size; ++i) {
+        if (std::tolower(data[i]) != std::tolower((unsigned char) literal[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool looks_like_svg(const unsigned char * data, size_t size) {
+    if (!data || size == 0) {
+        return false;
+    }
+
+    size_t pos = 0;
+    if (size >= 3 && data[0] == 0xef && data[1] == 0xbb && data[2] == 0xbf) {
+        pos = 3;
+    }
+    auto skip_space = [&]() {
+        while (pos < size && std::isspace(data[pos])) {
+            ++pos;
+        }
+    };
+    skip_space();
+
+    if (ascii_starts_with_ci(data + pos, size - pos, "<?xml")) {
+        while (pos + 1 < size && !(data[pos] == '?' && data[pos + 1] == '>')) {
+            ++pos;
+        }
+        pos = std::min(size, pos + 2);
+        skip_space();
+    }
+
+    return ascii_starts_with_ci(data + pos, size - pos, "<svg") &&
+           (pos + 4 == size || std::isspace(data[pos + 4]) || data[pos + 4] == '>' || data[pos + 4] == '/');
+}
 
 mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigned char * buf, size_t len) {
     if (audio_helpers::is_audio_file((const char *)buf, len)) {
@@ -603,6 +657,11 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigne
     }
 
     // otherwise, we assume it's an image
+    if (looks_like_svg(buf, len)) {
+        LOG_ERR("%s: SVG images are not supported; convert to PNG or JPEG\n", __func__);
+        return nullptr;
+    }
+
     mtmd_bitmap * result = nullptr;
     {
         int nx, ny, nc;
@@ -629,16 +688,11 @@ mtmd_bitmap * mtmd_helper_bitmap_init_from_buf(mtmd_context * ctx, const unsigne
 
             // Detect common unsupported formats and give a clearer error
             if (len >= 12 && memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WEBP", 4) == 0) {
-                LOG_ERR("%s: WebP decoding failed. Ensure Windows 10 version 1809 or later is installed.\n", __func__);
-            } else if (len >= 12 && memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "AVIF", 4) == 0) {
-                LOG_ERR("%s: AVIF decoding failed. Ensure the AV1 Video Extension is installed.\n", __func__);
-            } else if (len >= 4 && memcmp(buf, "\x00\x00\x00\x1c", 4) == 0 && len >= 16 && (
-                       memcmp(buf + 8, "ftyp", 4) == 0)) {
-                // HEIC/AVIF container (ISO Base Media File Format)
-                LOG_ERR("%s: HEIC/AVIF container decoding failed. Ensure the HEVC Video Extension is installed.\n", __func__);
-            } else if (len >= 5 && memcmp(buf, "<?xml", 5) == 0) {
-                LOG_ERR("%s: SVG images are not supported. "
-                        "Please convert the image to PNG or JPEG before sending.\n", __func__);
+                LOG_ERR("%s: WebP decoding failed. Ensure a Windows WebP codec is installed.\n", __func__);
+            } else if (len >= 12 && memcmp(buf + 4, "ftyp", 4) == 0) {
+                const bool is_avif = memcmp(buf + 8, "avif", 4) == 0 || memcmp(buf + 8, "avis", 4) == 0;
+                LOG_ERR("%s: %s decoding failed. Ensure the corresponding Windows image extension is installed.\n",
+                        __func__, is_avif ? "AVIF" : "HEIC/ISO-BMFF");
             }
             return nullptr;
         }

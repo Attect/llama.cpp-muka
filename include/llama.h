@@ -511,6 +511,15 @@ extern "C" {
     LLAMA_API const char * llama_model_get_tensor_name(const struct llama_model * model, size_t i);
     LLAMA_API struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
 
+    // Experimental support used by the custom mmproj GPU swap server mode.
+    // The model owns every replacement buffer throughout the transition, so
+    // callers must not free or rebind model tensor buffers themselves.
+    LLAMA_API bool   llama_model_gpu_swap_supported(const struct llama_model * model);
+    LLAMA_API bool   llama_model_gpu_swap_to_cpu   (      struct llama_model * model);
+    LLAMA_API bool   llama_model_gpu_swap_to_gpu   (      struct llama_model * model);
+    LLAMA_API bool   llama_model_gpu_swap_active   (const struct llama_model * model);
+    LLAMA_API size_t llama_model_gpu_swap_size     (const struct llama_model * model);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);
@@ -526,6 +535,11 @@ extern "C" {
     // Reset the backend scheduler to re-evaluate backend assignments for tensors
     // Used after GPU swap operations to update tensor location tracking
     LLAMA_API void llama_context_sched_update(struct llama_context * ctx);
+
+    // Release/recreate scheduler-owned compute buffers around model weight
+    // migration. A suspended context must be resumed before it is used again.
+    LLAMA_API bool llama_context_sched_suspend(struct llama_context * ctx);
+    LLAMA_API bool llama_context_sched_resume (struct llama_context * ctx);
 
     LLAMA_API int64_t llama_time_us(void);
 

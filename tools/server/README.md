@@ -179,6 +179,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-mmu, --mmproj-url URL` | URL to a multimodal projector file. see tools/mtmd/README.md<br/>(env: LLAMA_ARG_MMPROJ_URL) |
 | `--mmproj-auto, --no-mmproj, --no-mmproj-auto` | whether to use multimodal projector file (if available), useful when using -hf (default: enabled)<br/>(env: LLAMA_ARG_MMPROJ_AUTO) |
 | `--mmproj-offload, --no-mmproj-offload` | whether to enable GPU offloading for multimodal projector (default: enabled)<br/>(env: LLAMA_ARG_MMPROJ_OFFLOAD) |
+| `--mmproj-gpu-swap, --no-mmproj-gpu-swap` | whether to move model weights to CPU while encoding media on the GPU (default: disabled; requires one CUDA device and one server slot)<br/>(env: LLAMA_ARG_MMPROJ_GPU_SWAP) |
+| `--mmproj-cache-dir DIR` | directory for the persistent image embedding cache (default: disabled)<br/>(env: LLAMA_ARG_MMPROJ_CACHE_DIR) |
 | `--image-min-tokens N` | minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)<br/>(env: LLAMA_ARG_IMAGE_MIN_TOKENS) |
 | `--image-max-tokens N` | maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)<br/>(env: LLAMA_ARG_IMAGE_MAX_TOKENS) |
 | `-a, --alias STRING` | set model name aliases, comma-separated (to be used by API)<br/>(env: LLAMA_ARG_ALIAS) |

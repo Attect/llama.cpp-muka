@@ -78,18 +78,14 @@ bool clip_gpu_upload(struct clip_ctx * ctx);
 bool clip_gpu_download(struct clip_ctx * ctx);
 
 /**
- * Check if clip is in GPU swap mode
- * @param ctx clip context
- * @return true if gpu_swap_mode is enabled
+ * Check whether the initialized clip context can migrate weights to its GPU backend.
  */
-bool clip_is_gpu_swap_mode(const struct clip_ctx * ctx);
+bool clip_gpu_swap_supported(const struct clip_ctx * ctx);
 
 /**
- * Set GPU swap mode (must be called before clip_init finishes)
- * @param ctx clip context
- * @param enabled whether to enable GPU swap mode
+ * Check if clip is in GPU swap mode.
  */
-void clip_set_gpu_swap_mode(struct clip_ctx * ctx, bool enabled);
+bool clip_is_gpu_swap_mode(const struct clip_ctx * ctx);
 
 size_t clip_embd_nbytes(const struct clip_ctx * ctx);
 size_t clip_embd_nbytes_by_img(const struct clip_ctx * ctx, int img_w, int img_h);

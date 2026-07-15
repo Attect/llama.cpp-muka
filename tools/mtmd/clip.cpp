@@ -157,20 +157,17 @@ struct clip_ctx {
     // === GPU swap support ===
     bool gpu_swap_mode = false;   // whether GPU swap mode is enabled
 
-    // CPU buffer (always kept in GPU swap mode, used as backup)
-    ggml_backend_buffer_ptr buf_cpu;
-
-    // GPU buffer (created on upload, freed on download)
-    ggml_backend_buffer_ptr buf_gpu;
-
-    // Tensor address mapping for CPU state restoration
-    // Maps tensor -> CPU data pointer
-    std::unordered_map<struct ggml_tensor *, void *> cpu_data_ptrs;
-    // Maps tensor -> CPU buffer pointer
-    std::unordered_map<struct ggml_tensor *, ggml_backend_buffer_t> cpu_buffer_ptrs;
+    struct cpu_tensor_snapshot {
+        struct ggml_tensor * tensor;
+        struct ggml_tensor state;
+    };
+    std::vector<cpu_tensor_snapshot> cpu_tensor_states;
+    std::vector<ggml_backend_buffer_ptr> bufs_gpu;
 
     int max_nodes = 8192;
     ggml_backend_sched_ptr sched;
+    ggml_backend_sched_eval_callback cb_eval = nullptr;
+    void * cb_eval_user_data = nullptr;
     clip_flash_attn_type flash_attn_type = CLIP_FLASH_ATTN_TYPE_AUTO;
     bool is_allocated = false;
 
@@ -185,6 +182,8 @@ struct clip_ctx {
         flash_attn_type = ctx_params.flash_attn_type;
         gpu_swap_mode = ctx_params.gpu_swap_mode;
         no_alloc = ctx_params.no_alloc;
+        cb_eval = ctx_params.cb_eval;
+        cb_eval_user_data = ctx_params.cb_eval_user_data;
         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!backend_cpu) {
             throw std::runtime_error("failed to initialize CPU backend");
@@ -228,14 +227,20 @@ struct clip_ctx {
             ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), 8192, false, true)
         );
 
-        if (ctx_params.cb_eval != nullptr) {
-            ggml_backend_sched_set_eval_callback(sched.get(), ctx_params.cb_eval, ctx_params.cb_eval_user_data);
+        if (cb_eval != nullptr) {
+            ggml_backend_sched_set_eval_callback(sched.get(), cb_eval, cb_eval_user_data);
         }
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
     }
 
     ~clip_ctx() {
+        // Scheduler and weight buffers keep backend-specific resources. Release
+        // them before destroying the backend objects they reference.
+        sched.reset();
+        bufs_gpu.clear();
+        buf.reset();
+
         ggml_backend_free(backend);
         if (backend != backend_cpu) {
             ggml_backend_free(backend_cpu);
@@ -247,6 +252,33 @@ struct clip_ctx {
         return model.proj_type;
     }
 };
+
+static bool clip_reset_scheduler(clip_ctx * ctx) {
+    if (!ctx) {
+        return false;
+    }
+    if (ctx->sched) {
+        ggml_backend_sched_synchronize(ctx->sched.get());
+    }
+
+    ctx->sched.reset(ggml_backend_sched_new(
+        ctx->backend_ptrs.data(),
+        ctx->backend_buft.data(),
+        ctx->backend_ptrs.size(),
+        ctx->max_nodes,
+        false,
+        true));
+    if (!ctx->sched) {
+        return false;
+    }
+    if (ctx->cb_eval) {
+        ggml_backend_sched_set_eval_callback(ctx->sched.get(), ctx->cb_eval, ctx->cb_eval_user_data);
+    }
+
+    ctx->is_allocated = false;
+    ctx->mem_compute.clear();
+    return true;
+}
 
 //
 // clip_graph
@@ -2626,13 +2658,17 @@ struct clip_model_loader {
                 // GPU swap mode: always allocate on CPU, keep CPU buffer as backup
                 buft = ggml_backend_get_default_buffer_type(ctx_clip.backend_cpu);
                 ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+                if (!ctx_clip.buf) {
+                    throw std::runtime_error("failed to allocate CPU buffer for GPU swap mode");
+                }
                 ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                ctx_clip.buf_gpu = nullptr;
+                ctx_clip.bufs_gpu.clear();
 
-                // Save CPU tensor address mapping for later restoration after GPU upload
+                // Keep complete CPU tensor metadata so a GPU upload can be
+                // rolled back without leaving partially rebound tensors.
+                ctx_clip.cpu_tensor_states.clear();
                 for (struct ggml_tensor * t = ggml_get_first_tensor(ctx_clip.ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx_clip.ctx_data.get(), t)) {
-                    ctx_clip.cpu_data_ptrs[t] = t->data;
-                    ctx_clip.cpu_buffer_ptrs[t] = t->buffer;
+                    ctx_clip.cpu_tensor_states.push_back({t, *t});
                 }
             } else {
                 // Original logic: allocate on the default backend (GPU if available, else CPU)
@@ -4364,112 +4400,191 @@ void clip_set_debug_output_embeddings(clip_ctx * ctx, bool enable) {
 // GPU swap support
 //
 
-bool clip_gpu_upload(struct clip_ctx * ctx) {
-    if (!ctx || !ctx->gpu_swap_mode) return false;
-    if (ctx->buf_gpu) return true; // already on GPU
+struct clip_gpu_tensor_allocation {
+    ggml_tensor * tensor;
+    size_t buffer_index;
+    size_t offset;
+};
 
-    // Use the clip_ctx's own backend (initialized during clip_init)
-    // This must be a GPU backend for upload to work
-    if (ggml_backend_is_cpu(ctx->backend)) {
-        LOG_ERR("clip_gpu_upload: backend is CPU, no GPU to upload to\n");
+static bool clip_checked_align_up(size_t value, size_t alignment, size_t & result) {
+    if (alignment == 0 || value > SIZE_MAX - (alignment - 1)) {
+        return false;
+    }
+    result = GGML_PAD(value, alignment);
+    return true;
+}
+
+static void clip_restore_cpu_tensor_states(clip_ctx * ctx) {
+    for (const auto & snapshot : ctx->cpu_tensor_states) {
+        *snapshot.tensor = snapshot.state;
+    }
+}
+
+bool clip_gpu_upload(struct clip_ctx * ctx) {
+    if (!ctx || !ctx->gpu_swap_mode) {
+        return false;
+    }
+    if (!ctx->bufs_gpu.empty()) {
+        return true;
+    }
+    if (!ctx->backend || ggml_backend_is_cpu(ctx->backend) || ctx->cpu_tensor_states.empty()) {
+        LOG_ERR("%s: no GPU backend or CPU tensor state is available\n", __func__);
         return false;
     }
 
-    LOG_INF("clip_gpu_upload: using backend '%s' for GPU upload\n", ggml_backend_name(ctx->backend));
+    // Release CPU-oriented compute reservations before moving the weights.
+    if (!clip_reset_scheduler(ctx)) {
+        LOG_ERR("%s: failed to reset scheduler before upload\n", __func__);
+        return false;
+    }
 
     ggml_backend_buffer_type_t gpu_buft = ggml_backend_get_default_buffer_type(ctx->backend);
-
-    // Log free VRAM before allocation attempt
-    ggml_backend_dev_t gpu_dev = ggml_backend_get_device(ctx->backend);
-    if (gpu_dev) {
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(gpu_dev, &props);
-        LOG_INF("clip_gpu_upload: GPU device VRAM: total=%zu MiB, free=%zu MiB\n",
-                props.memory_total / 1024 / 1024, props.memory_free / 1024 / 1024);
-    }
-
-    // Calculate total size needed for GPU buffer with alignment
-    size_t total_size = 0;
-    size_t alignment = ggml_backend_buft_get_alignment(gpu_buft);
-
-    // First pass: calculate total size with alignment
-    std::vector<std::pair<ggml_tensor *, size_t>> tensor_offsets;
-    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx->ctx_data.get(), t)) {
-        size_t aligned_offset = GGML_PAD(total_size, alignment);
-        tensor_offsets.push_back({t, aligned_offset});
-        total_size = aligned_offset + ggml_nbytes(t);
-    }
-
-    LOG_INF("clip_gpu_upload: total_size needed=%zu MiB (%zu bytes), n_tensors=%zu\n",
-            total_size / 1024 / 1024, total_size, tensor_offsets.size());
-
-    // Allocate GPU buffer
-    ggml_backend_buffer_t gpu_buf = ggml_backend_buft_alloc_buffer(gpu_buft, total_size);
-    if (!gpu_buf) {
-        LOG_ERR("clip_gpu_upload: failed to allocate GPU buffer (%zu bytes = %zu MiB)\n",
-                total_size, total_size / 1024 / 1024);
+    const size_t alignment = ggml_backend_buft_get_alignment(gpu_buft);
+    const size_t max_size = ggml_backend_buft_get_max_size(gpu_buft);
+    if (alignment == 0 || max_size == 0) {
         return false;
     }
 
-    // Second pass: assign tensors to GPU buffer and copy data
-    for (auto & [t, offset] : tensor_offsets) {
-        // Get CPU data from saved mapping
-        void * cpu_data = ctx->cpu_data_ptrs[t];
-        size_t nbytes = ggml_nbytes(t);
+    std::vector<size_t> buffer_sizes(1, 0);
+    std::vector<clip_gpu_tensor_allocation> allocations;
+    allocations.reserve(ctx->cpu_tensor_states.size());
 
-        // Detach tensor from CPU buffer so ggml_backend_tensor_alloc can accept it
-        t->buffer = nullptr;
-        t->data = nullptr;
+    for (const auto & snapshot : ctx->cpu_tensor_states) {
+        if (snapshot.state.view_src != nullptr) {
+            continue;
+        }
 
-        // Assign tensor to GPU buffer
-        ggml_backend_tensor_alloc(gpu_buf, t, (uint8_t *)ggml_backend_buffer_get_base(gpu_buf) + offset);
+        const size_t alloc_size = ggml_backend_buft_get_alloc_size(gpu_buft, &snapshot.state);
+        size_t offset = 0;
+        if (!clip_checked_align_up(buffer_sizes.back(), alignment, offset)) {
+            return false;
+        }
+        if (buffer_sizes.back() > 0 && (offset > max_size || alloc_size > max_size - offset)) {
+            buffer_sizes.push_back(0);
+            offset = 0;
+        }
+        if (alloc_size > max_size || offset > max_size - alloc_size) {
+            LOG_ERR("%s: tensor '%s' is too large for the GPU buffer type\n", __func__, snapshot.state.name);
+            return false;
+        }
 
-        // Copy data from CPU to GPU
-        ggml_backend_tensor_set(t, cpu_data, 0, nbytes);
+        allocations.push_back({snapshot.tensor, buffer_sizes.size() - 1, offset});
+        buffer_sizes.back() = offset + alloc_size;
+    }
+    if (allocations.empty()) {
+        return false;
     }
 
-    ctx->buf_gpu.reset(gpu_buf);
-
-    // Reset scheduler since tensor locations changed
-    if (ctx->sched) {
-        ggml_backend_sched_reset(ctx->sched.get());
+    std::vector<ggml_backend_buffer_ptr> gpu_buffers;
+    gpu_buffers.reserve(buffer_sizes.size());
+    for (const size_t size : buffer_sizes) {
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(gpu_buft, size);
+        if (!buffer) {
+            LOG_ERR("%s: failed to allocate GPU weight buffer of %.2f MiB\n",
+                __func__, size / 1024.0 / 1024.0);
+            return false;
+        }
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        gpu_buffers.emplace_back(buffer);
     }
 
-    LOG_INF("clip_gpu_upload: uploaded clip weights to GPU (%zu bytes)\n", total_size);
+    for (const auto & allocation : allocations) {
+        ggml_backend_buffer_t buffer = gpu_buffers[allocation.buffer_index].get();
+        void * base = ggml_backend_buffer_get_base(buffer);
+        if (!base && buffer_sizes[allocation.buffer_index] != 0) {
+            clip_restore_cpu_tensor_states(ctx);
+            return false;
+        }
+
+        ggml_tensor * tensor = allocation.tensor;
+        tensor->buffer = nullptr;
+        tensor->data = nullptr;
+        tensor->extra = nullptr;
+        void * address = base ? static_cast<uint8_t *>(base) + allocation.offset : nullptr;
+        if (ggml_backend_tensor_alloc(buffer, tensor, address) != GGML_STATUS_SUCCESS) {
+            clip_restore_cpu_tensor_states(ctx);
+            return false;
+        }
+    }
+
+    size_t pending_views = 0;
+    for (const auto & snapshot : ctx->cpu_tensor_states) {
+        if (snapshot.state.view_src != nullptr) {
+            snapshot.tensor->buffer = nullptr;
+            snapshot.tensor->data = nullptr;
+            snapshot.tensor->extra = nullptr;
+            pending_views++;
+        }
+    }
+    while (pending_views > 0) {
+        bool made_progress = false;
+        for (const auto & snapshot : ctx->cpu_tensor_states) {
+            ggml_tensor * tensor = snapshot.tensor;
+            if (snapshot.state.view_src == nullptr || tensor->buffer != nullptr) {
+                continue;
+            }
+            if (!tensor->view_src || tensor->view_src->buffer == nullptr) {
+                continue;
+            }
+            if (ggml_backend_view_init(tensor) != GGML_STATUS_SUCCESS) {
+                clip_restore_cpu_tensor_states(ctx);
+                return false;
+            }
+            pending_views--;
+            made_progress = true;
+        }
+        if (!made_progress) {
+            clip_restore_cpu_tensor_states(ctx);
+            return false;
+        }
+    }
+
+    for (const auto & snapshot : ctx->cpu_tensor_states) {
+        if (snapshot.state.view_src == nullptr && ggml_nbytes(&snapshot.state) > 0) {
+            ggml_backend_tensor_copy(&snapshot.state, snapshot.tensor);
+        }
+    }
+
+    size_t total_size = 0;
+    for (const size_t size : buffer_sizes) {
+        total_size += size;
+    }
+    ctx->bufs_gpu = std::move(gpu_buffers);
+    ctx->is_allocated = false;
+
+    LOG_INF("%s: uploaded clip weights to GPU (%.2f MiB in %zu buffer(s))\n",
+        __func__, total_size / 1024.0 / 1024.0, ctx->bufs_gpu.size());
     return true;
 }
 
 bool clip_gpu_download(struct clip_ctx * ctx) {
-    if (!ctx || !ctx->gpu_swap_mode) return false;
-    if (!ctx->buf_gpu) return true; // already on CPU
-
-    // Restore all tensors to CPU buffer state
-    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx->ctx_data.get()); t != nullptr; t = ggml_get_next_tensor(ctx->ctx_data.get(), t)) {
-        // Restore CPU data pointer and buffer from saved mapping
-        auto it_data = ctx->cpu_data_ptrs.find(t);
-        auto it_buf = ctx->cpu_buffer_ptrs.find(t);
-        if (it_data != ctx->cpu_data_ptrs.end() && it_buf != ctx->cpu_buffer_ptrs.end()) {
-            t->data = it_data->second;
-            t->buffer = it_buf->second;
-        }
+    if (!ctx || !ctx->gpu_swap_mode) {
+        return false;
+    }
+    if (ctx->bufs_gpu.empty()) {
+        return true;
     }
 
-    // Free GPU buffer
-    ctx->buf_gpu.reset();
-
-    // Reset scheduler since tensor locations changed
-    if (ctx->sched) {
-        ggml_backend_sched_reset(ctx->sched.get());
+    // Destroy GPU compute reservations while every tensor still points at a
+    // valid GPU buffer, then restore the persistent CPU tensor metadata.
+    if (!clip_reset_scheduler(ctx)) {
+        LOG_ERR("%s: failed to reset scheduler before download\n", __func__);
+        return false;
     }
 
-    LOG_INF("clip_gpu_download: released clip GPU weights\n");
+    clip_restore_cpu_tensor_states(ctx);
+    ctx->bufs_gpu.clear();
+    ctx->is_allocated = false;
+
+    LOG_INF("%s: released clip GPU weights\n", __func__);
     return true;
+}
+
+bool clip_gpu_swap_supported(const struct clip_ctx * ctx) {
+    return ctx && ctx->gpu_swap_mode && ctx->backend &&
+           !ggml_backend_is_cpu(ctx->backend) && !ctx->cpu_tensor_states.empty();
 }
 
 bool clip_is_gpu_swap_mode(const struct clip_ctx * ctx) {
     return ctx && ctx->gpu_swap_mode;
-}
-
-void clip_set_gpu_swap_mode(struct clip_ctx * ctx, bool enabled) {
-    if (ctx) ctx->gpu_swap_mode = enabled;
 }

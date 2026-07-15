@@ -713,6 +713,16 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        // Restore and detach the custom swap manager while all referenced
+        // llama/mtmd objects are still alive.
+        if (gpu_swap) {
+            if (!gpu_swap->restore_for_shutdown(mctx)) {
+                SRV_WRN("%s", "failed to fully restore GPU swap state during shutdown\n");
+            }
+            gpu_swap.reset();
+        }
+        mtmd_cache_ctx.reset();
+
         spec.reset();
         ctx_dft.reset();
         model_dft.reset();
@@ -901,62 +911,17 @@ private:
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
-            // GPU swap mode: allow swapping mmproj between CPU and GPU to share VRAM with text model
-            // Only enable swap when model is too large to fit in VRAM with mmproj
-            bool need_gpu_swap = false;
+            // GPU swap is an explicit opt-in. Do not guess from GGUF file size:
+            // partial offload and available VRAM make such thresholds unreliable.
             if (params_base.mmproj_gpu_swap) {
-                // Check model type and size to determine if swap is needed
-                char arch_buf[128] = {0};
-                llama_model_meta_val_str(model_tgt, "general.architecture", arch_buf, sizeof(arch_buf));
-                std::string arch(arch_buf);
+                mparams.gpu_swap_mode = true;
+                mparams.use_gpu = false;
 
-                // Get model file size
-                size_t model_size_bytes = 0;
-                {
-                    std::ifstream ifs(params_base.model.path, std::ios::binary | std::ios::ate);
-                    if (ifs.is_open()) {
-                        model_size_bytes = ifs.tellg();
-                        ifs.close();
-                    }
+                if (!llama_model_gpu_swap_supported(model_tgt)) {
+                    SRV_ERR("%s", "--mmproj-gpu-swap requires a single CUDA device and safely migratable model buffers\n");
+                    return false;
                 }
-                double model_size_gb = static_cast<double>(model_size_bytes) / (1024.0 * 1024.0 * 1024.0);
-
-                // Determine if swap is needed based on model type and size
-                // MOE models: threshold is 21GB
-                // Dense models: threshold is 16GB
-                bool is_moe = (arch.find("mamba") != std::string::npos ||
-                              arch.find("jamba") != std::string::npos ||
-                              arch.find("mixtral") != std::string::npos);
-
-                if (is_moe && model_size_gb >= 21.0) {
-                    need_gpu_swap = true;
-                    SRV_INF("%s", "MOE model detected (%.2f GB), GPU swap enabled\n", model_size_gb);
-                } else if (!is_moe && model_size_gb >= 16.0) {
-                    need_gpu_swap = true;
-                    SRV_INF("%s", "Dense model detected (%.2f GB), GPU swap enabled\n", model_size_gb);
-                } else {
-                    SRV_INF("%s", "Model size (%.2f GB) fits in VRAM with mmproj, no swap needed\n", model_size_gb);
-                }
-
-                if (need_gpu_swap) {
-                    mparams.gpu_swap_mode = true;
-
-                    // Force mmproj to load on CPU for swapping during inference
-                    // This allows the text model to use GPU memory, and mmproj will be
-                    // swapped to GPU only when image processing is needed
-                    mparams.use_gpu = false;
-
-                    gpu_swap = std::make_unique<gpu_swap_manager>();
-                    gpu_swap->enabled = true;
-
-                    // n_parallel was already forced to 1 before context creation
-
-                    SRV_INF("%s", "GPU swap mode enabled: mmproj on CPU (will swap to GPU for image processing)\n");
-                } else {
-                    // No swap needed - mmproj and model can coexist in VRAM
-                    mparams.gpu_swap_mode = false;
-                    SRV_INF("%s", "GPU swap disabled: model fits in VRAM with mmproj\n");
-                }
+                SRV_INF("%s", "GPU swap requested: mmproj starts on CPU and is uploaded only while encoding media\n");
             }
 
             mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
@@ -964,7 +929,27 @@ private:
                 SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
                 return false;
             }
-               SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            if (params_base.mmproj_gpu_swap) {
+                if (!mtmd_gpu_swap_supported(mctx)) {
+                    SRV_ERR("%s", "mmproj GPU swap backend is unavailable\n");
+                    return false;
+                }
+
+                std::vector<llama_context *> swap_contexts = {ctx_tgt};
+                if (ctx_dft && llama_get_model(ctx_dft.get()) == model_tgt) {
+                    swap_contexts.push_back(ctx_dft.get());
+                }
+
+                gpu_swap = std::make_unique<gpu_swap_manager>();
+                if (!gpu_swap->configure(model_tgt, swap_contexts)) {
+                    SRV_ERR("%s", "failed to initialize safe model/mmproj GPU swap\n");
+                    gpu_swap.reset();
+                    return false;
+                }
+                SRV_INF("GPU swap enabled for %zu llama context(s)\n", swap_contexts.size());
+            }
 
             // Initialize image tokenization cache
             if (!params_base.mmproj_cache_dir.empty()) {
@@ -2784,7 +2769,10 @@ private:
                                             // predicate below never matches. Instead, accept any checkpoint that
                                             // already covers the prefix we still need to process.
                                             if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
-                                                return (int) cur.pos_max <= pos_next;
+                                                // Recurrent state summarizes every processed token, so restoring a
+                                                // checkpoint that reaches the mismatch (or was created after it)
+                                                // would silently retain state from the old prompt.
+                                                return cur.n_tokens < (int64_t) n_past && cur.pos_max < pos_next;
                                             }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
@@ -2896,27 +2884,38 @@ private:
                             n_swa > 0);
 
                     bool has_mtmd = false;
+                    bool mtmd_failed = false;
 
-                     // check if we should process the image
+                    // check if we should process the image
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
-                        // process the image
+                        // Encode once on the target context. MTP draft contexts sharing
+                        // the same model reuse the exact embedding instead of running the
+                        // mmproj a second time on CPU.
                         size_t n_tokens_out = 0;
-                        int32_t res = input_tokens.process_chunk(ctx_tgt, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out,
-                            gpu_swap.get(), mtmd_cache_ctx.get(), model_tgt);
+                        server_mtmd_embedding shared_embedding;
+                        int32_t res = input_tokens.process_chunk(
+                            ctx_tgt, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(),
+                            slot.id, n_tokens_out, gpu_swap.get(), mtmd_cache_ctx.get(),
+                            ctx_dft ? &shared_embedding : nullptr, nullptr);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
                             slot.release();
-                            continue;
+                            mtmd_failed = true;
+                            break;
                         }
 
                         if (ctx_dft) {
-                            // TODO: in the future, figure out how to infuse target embeddings to the images
-                            //       for now, we skip this for simplicity
-                            //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
-                            res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
-                            if (res != 0) {
-                                GGML_ABORT("failed to process multi-modal data on draft context\n");
+                            size_t n_tokens_dft = 0;
+                            res = input_tokens.process_chunk(
+                                ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(),
+                                slot.id, n_tokens_dft, nullptr, mtmd_cache_ctx.get(), nullptr, &shared_embedding);
+                            if (res != 0 || n_tokens_dft != n_tokens_out) {
+                                SLT_ERR(slot, "failed to process multi-modal data on draft context, res = %d\n", res);
+                                send_error(slot, "failed to process image on draft context", ERROR_TYPE_SERVER);
+                                slot.release();
+                                mtmd_failed = true;
+                                break;
                             }
                         }
 
@@ -2929,6 +2928,10 @@ private:
                         }
 
                         has_mtmd = true;
+                    }
+
+                    if (mtmd_failed) {
+                        continue;
                     }
 
                     // add prompt tokens for processing in the current batch
@@ -3026,7 +3029,8 @@ private:
                     // no need for empty or small checkpoints
                     // hybrid/recurrent models (e.g. Qwen3.5/3.6) benefit from smaller checkpoints
                     const int checkpoint_min_tokens = (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) ? 4 : 64;
-                    do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.prompt.n_tokens() >= checkpoint_min_tokens);
+                    const int64_t checkpoint_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+                    do_checkpoint = do_checkpoint && (pos_min >= 0 && checkpoint_n_tokens >= checkpoint_min_tokens);
 
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;

@@ -389,7 +389,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
-    if (!model.hparams.no_alloc) {
+    if (!model.hparams.no_alloc && sched) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -406,6 +406,41 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+}
+
+bool llama_context::sched_suspend() {
+    if (!sched) {
+        sched_need_reserve = true;
+        return true;
+    }
+
+    try {
+        synchronize();
+        sched.reset();
+        gf_res_prev.reset();
+        gf_res_reserve.reset();
+        sched_need_reserve = true;
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to suspend scheduler: %s\n", __func__, err.what());
+        return false;
+    }
+}
+
+bool llama_context::sched_resume() {
+    if (sched && !sched_need_reserve) {
+        return true;
+    }
+
+    try {
+        sched_need_reserve = true;
+        sched_reserve();
+        return sched != nullptr;
+    } catch (const std::exception & err) {
+        sched_need_reserve = true;
+        LLAMA_LOG_ERROR("%s: failed to resume scheduler: %s\n", __func__, err.what());
+        return false;
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -4006,14 +4041,18 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
     return ctx->memory_breakdown();
 }
 
-// Reset the backend scheduler to re-evaluate backend assignments for tensors
-// Used after GPU swap operations to update tensor location tracking
+bool llama_context_sched_suspend(struct llama_context * ctx) {
+    return ctx && ctx->sched_suspend();
+}
+
+bool llama_context_sched_resume(struct llama_context * ctx) {
+    return ctx && ctx->sched_resume();
+}
+
+// Reset the backend scheduler to re-evaluate backend assignments for tensors.
 void llama_context_sched_update(struct llama_context * ctx) {
-    if (!ctx) return;
-    // Reset the scheduler to clear old allocations and assignments
-    ggml_backend_sched_reset(ctx->get_sched());
-    // Mark scheduler for re-reserve on next use
-    // This ensures the scheduler re-evaluates which backend handles each operation
-    // based on the current tensor locations (which may have changed due to GPU swap)
-    ctx->sched_reserve();
+    if (!llama_context_sched_suspend(ctx)) {
+        return;
+    }
+    (void) llama_context_sched_resume(ctx);
 }

@@ -604,6 +604,12 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    bool   gpu_swap_supported() const;
+    bool   gpu_swap_to_cpu();
+    bool   gpu_swap_to_gpu();
+    bool   gpu_swap_active() const;
+    size_t gpu_swap_size() const;
+
     // total number of parameters in the model
     uint64_t n_elements() const;
 

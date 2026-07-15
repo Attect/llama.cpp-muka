@@ -9,10 +9,8 @@ add_library(mtmd
             mtmd.h
             mtmd-helper.cpp
             mtmd-helper.h
-                     clip.cpp
+            clip.cpp
             clip.h
-            mtmd-cache.cpp
-            mtmd-cache.h
             clip-impl.h
             clip-model.h
             clip-graph.h

@@ -362,12 +362,11 @@ MTMD_API bool mtmd_gpu_swap_upload(mtmd_context * ctx);
 // Returns true on success
 MTMD_API bool mtmd_gpu_swap_download(mtmd_context * ctx);
 
-// Check if GPU swap mode is enabled
-MTMD_API bool mtmd_is_gpu_swap_mode(mtmd_context * ctx);
+// Check whether every initialized media encoder has a usable GPU swap backend.
+MTMD_API bool mtmd_gpu_swap_supported(mtmd_context * ctx);
 
-// Get the internal clip_ctx for vision (needed by server-level GPU swap manager)
-// This allows the server's gpu_swap_manager to call clip_gpu_upload/clip_gpu_download directly
-MTMD_API struct clip_ctx * mtmd_get_clip_ctx(mtmd_context * ctx);
+// Check if GPU swap mode is enabled.
+MTMD_API bool mtmd_is_gpu_swap_mode(mtmd_context * ctx);
 
 #endif
 

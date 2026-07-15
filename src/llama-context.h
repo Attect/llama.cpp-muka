@@ -54,6 +54,9 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    bool sched_suspend();
+    bool sched_resume();
+
     void synchronize();
 
     const llama_model   & get_model()   const;

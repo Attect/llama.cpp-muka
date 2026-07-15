@@ -273,6 +273,14 @@ llama_build_and_test(test-mtmd-c-api.c)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
 unset(LLAMA_TEST_NAME)
 
+add_executable(test-mtmd-cache
+    test-mtmd-cache.cpp
+    ../tools/mtmd/mtmd-cache.cpp
+)
+target_include_directories(test-mtmd-cache PRIVATE ../tools/mtmd)
+target_compile_features(test-mtmd-cache PRIVATE cxx_std_17)
+llama_test(test-mtmd-cache)
+
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)
 if (TARGET cpp-httplib)

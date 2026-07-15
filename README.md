@@ -46,14 +46,9 @@
 
 ### 触发条件
 
-GPU Swap 仅在模型过大、显存不足以同时容纳模型和 mmproj 时启用：
+GPU Swap 仅在显式传入 `--mmproj-gpu-swap` 时启用，不再根据 GGUF 文件大小或模型类型自动判断。该模式要求单个 CUDA 设备、单并发，以及可安全迁移的模型权重 buffer；条件不满足时服务端会拒绝启动，而不是静默退回不完整的 swap 状态。
 
-| 模型类型 | 文件大小阈值 | 说明 |
-|---------|-------------|------|
-| 稠密模型 | ≥ 16 GB | 如 Qwen3.6-27B Q4_K_XL |
-| MOE模型 | ≥ 21 GB | 如 Mixtral 等 |
-
-如果模型大小低于阈值，说明显存足够同时容纳两者，无需交换。
+对于模型和 mmproj 可以同时放入显存的场景，通常无需启用该参数；是否启用应由实际显存预算决定，文件大小不能准确代表运行时显存占用。
 
 ### 命令行参数
 
@@ -96,7 +91,7 @@ llama-server \
 
 核心修改涉及以下文件：
 
-- **`tools/server/server-context.cpp`**：模型加载时根据模型类型和大小判断是否启用 swap，并在 context 创建前强制 `n_parallel=1`
+- **`tools/server/server-context.cpp`**：模型加载时处理显式 swap 配置、校验运行条件，并在 context 创建前强制 `n_parallel=1`
 - **`tools/server/server-gpu-swap.cpp`**：`swap_to_mmproj_gpu()` 和 `swap_to_model_gpu()` 实现模型权重与 mmproj 在 GPU/CPU 间的动态交换
 - **`tools/mtmd/clip.cpp`**：`clip_gpu_upload()` / `clip_gpu_download()` 实现 mmproj 权重在 GPU/CPU 间的上传/下载；GPU swap 模式下初始化 CUDA backend 并将 mmproj 加载到 CPU
 - **`tools/mtmd/mtmd.cpp`**：将 `gpu_swap_mode` 从 `mtmd_context_params` 正确传递给 `clip_context_params`

@@ -27,11 +27,13 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -955,7 +957,205 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    struct gpu_swap_entry {
+        size_t ctx_index = 0;
+        ggml_backend_buffer_type_t restore_buft = nullptr;
+        size_t original_size = 0;
+        bool on_cpu = false;
+    };
+
+    mutable std::mutex gpu_swap_mutex;
+    std::vector<gpu_swap_entry> gpu_swap_entries;
+    size_t gpu_swap_bytes = 0;
 };
+
+namespace {
+
+struct model_tensor_snapshot {
+    ggml_tensor * tensor;
+    ggml_tensor value;
+};
+
+struct model_tensor_allocation {
+    ggml_tensor * tensor;
+    size_t buffer_index;
+    size_t offset;
+};
+
+static bool checked_align_up(size_t value, size_t alignment, size_t & result) {
+    if (alignment == 0) {
+        return false;
+    }
+    if (value > SIZE_MAX - (alignment - 1)) {
+        return false;
+    }
+    result = GGML_PAD(value, alignment);
+    return true;
+}
+
+static bool migrate_model_context_buffers(
+        ggml_context * ctx,
+        std::vector<ggml_backend_buffer_ptr> & owned_buffers,
+        ggml_backend_buffer_type_t target_buft,
+        size_t * allocated_bytes) {
+    if (!ctx || !target_buft) {
+        return false;
+    }
+
+    std::vector<model_tensor_snapshot> snapshots;
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx);
+         tensor != nullptr;
+         tensor = ggml_get_next_tensor(ctx, tensor)) {
+        snapshots.push_back({tensor, *tensor});
+    }
+    if (snapshots.empty()) {
+        return false;
+    }
+
+    const size_t alignment = ggml_backend_buft_get_alignment(target_buft);
+    const size_t max_size = ggml_backend_buft_get_max_size(target_buft);
+    if (alignment == 0 || max_size == 0) {
+        return false;
+    }
+
+    std::vector<size_t> buffer_sizes(1, 0);
+    std::vector<model_tensor_allocation> allocations;
+    allocations.reserve(snapshots.size());
+
+    for (const auto & snapshot : snapshots) {
+        if (snapshot.value.view_src != nullptr) {
+            continue;
+        }
+
+        const size_t alloc_size = ggml_backend_buft_get_alloc_size(target_buft, &snapshot.value);
+        size_t offset = 0;
+        if (!checked_align_up(buffer_sizes.back(), alignment, offset)) {
+            return false;
+        }
+
+        if (buffer_sizes.back() > 0 && (offset > max_size || alloc_size > max_size - offset)) {
+            buffer_sizes.push_back(0);
+            offset = 0;
+        }
+
+        if (alloc_size > max_size || offset > max_size - alloc_size) {
+            return false;
+        }
+
+        allocations.push_back({snapshot.tensor, buffer_sizes.size() - 1, offset});
+        buffer_sizes.back() = offset + alloc_size;
+    }
+
+    if (allocations.empty()) {
+        return false;
+    }
+
+    std::vector<ggml_backend_buffer_ptr> replacement_buffers;
+    replacement_buffers.reserve(buffer_sizes.size());
+    for (const size_t size : buffer_sizes) {
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(target_buft, size);
+        if (!buffer) {
+            return false;
+        }
+        ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        replacement_buffers.emplace_back(buffer);
+    }
+
+    auto restore_snapshots = [&]() {
+        for (const auto & snapshot : snapshots) {
+            *snapshot.tensor = snapshot.value;
+        }
+    };
+
+    for (const auto & allocation : allocations) {
+        ggml_tensor * tensor = allocation.tensor;
+        ggml_backend_buffer_t buffer = replacement_buffers[allocation.buffer_index].get();
+        void * base = ggml_backend_buffer_get_base(buffer);
+        if (!base && buffer_sizes[allocation.buffer_index] != 0) {
+            restore_snapshots();
+            return false;
+        }
+
+        tensor->buffer = nullptr;
+        tensor->data = nullptr;
+        tensor->extra = nullptr;
+        void * address = base ? static_cast<uint8_t *>(base) + allocation.offset : nullptr;
+        if (ggml_backend_tensor_alloc(buffer, tensor, address) != GGML_STATUS_SUCCESS) {
+            restore_snapshots();
+            return false;
+        }
+    }
+
+    size_t pending_views = 0;
+    for (const auto & snapshot : snapshots) {
+        if (snapshot.value.view_src != nullptr) {
+            snapshot.tensor->buffer = nullptr;
+            snapshot.tensor->data = nullptr;
+            snapshot.tensor->extra = nullptr;
+            pending_views++;
+        }
+    }
+
+    while (pending_views > 0) {
+        bool made_progress = false;
+        for (const auto & snapshot : snapshots) {
+            ggml_tensor * tensor = snapshot.tensor;
+            if (snapshot.value.view_src == nullptr || tensor->buffer != nullptr) {
+                continue;
+            }
+            if (!tensor->view_src || tensor->view_src->buffer == nullptr) {
+                continue;
+            }
+            if (ggml_backend_view_init(tensor) != GGML_STATUS_SUCCESS) {
+                restore_snapshots();
+                return false;
+            }
+            pending_views--;
+            made_progress = true;
+        }
+        if (!made_progress) {
+            restore_snapshots();
+            return false;
+        }
+    }
+
+    for (const auto & snapshot : snapshots) {
+        if (snapshot.value.view_src == nullptr && ggml_nbytes(&snapshot.value) > 0) {
+            ggml_backend_tensor_copy(&snapshot.value, snapshot.tensor);
+        }
+    }
+
+    size_t total_size = 0;
+    for (const size_t size : buffer_sizes) {
+        total_size += size;
+    }
+
+    owned_buffers = std::move(replacement_buffers);
+    if (allocated_bytes) {
+        *allocated_bytes = total_size;
+    }
+    return true;
+}
+
+static bool is_supported_cuda_weight_buffer(ggml_backend_buffer_type_t buft, ggml_backend_dev_t & device) {
+    if (!buft || ggml_backend_buft_is_host(buft)) {
+        return false;
+    }
+
+    device = ggml_backend_buft_get_device(buft);
+    if (!device || ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+    const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+    const char * buft_name = ggml_backend_buft_name(buft);
+    return reg_name && strcmp(reg_name, "CUDA") == 0 &&
+           buft_name && strstr(buft_name, "_Split") == nullptr;
+}
+
+} // namespace
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
@@ -1628,6 +1828,198 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
         }
     }
     return ret;
+}
+
+bool llama_model::gpu_swap_supported() const {
+    std::lock_guard<std::mutex> lock(pimpl->gpu_swap_mutex);
+    if (!pimpl->gpu_swap_entries.empty()) {
+        return true;
+    }
+    if (hparams.no_alloc) {
+        return false;
+    }
+
+    std::unordered_set<ggml_backend_dev_t> devices;
+    bool found_device_weights = false;
+
+    for (const auto & [ctx, buffers] : pimpl->ctxs_bufs) {
+        GGML_UNUSED(ctx);
+        bool has_host_buffer = false;
+        bool has_device_buffer = false;
+
+        for (const auto & owned : buffers) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(owned.get());
+            if (ggml_backend_buft_is_host(buft)) {
+                has_host_buffer = true;
+                continue;
+            }
+
+            ggml_backend_dev_t device = nullptr;
+            if (!is_supported_cuda_weight_buffer(buft, device)) {
+                return false;
+            }
+            devices.insert(device);
+            has_device_buffer = true;
+            found_device_weights = true;
+        }
+
+        // A model-loader context is expected to contain one buffer type. Do not
+        // attempt to migrate an ownership group that mixes host and device data.
+        if (has_host_buffer && has_device_buffer) {
+            return false;
+        }
+    }
+
+    return found_device_weights && devices.size() == 1;
+}
+
+bool llama_model::gpu_swap_to_cpu() {
+    if (!gpu_swap_supported()) {
+        LLAMA_LOG_ERROR("%s: model buffers are not supported by the CUDA single-device swap path\n", __func__);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(pimpl->gpu_swap_mutex);
+    if (!pimpl->gpu_swap_entries.empty()) {
+        return std::all_of(
+            pimpl->gpu_swap_entries.begin(),
+            pimpl->gpu_swap_entries.end(),
+            [](const impl::gpu_swap_entry & entry) { return entry.on_cpu; });
+    }
+
+    const ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+    pimpl->gpu_swap_bytes = 0;
+
+    for (size_t ctx_index = 0; ctx_index < pimpl->ctxs_bufs.size(); ++ctx_index) {
+        auto & [ctx, buffers] = pimpl->ctxs_bufs[ctx_index];
+        ggml_backend_buffer_type_t restore_buft = nullptr;
+        size_t original_size = 0;
+        bool has_device_buffer = false;
+
+        for (const auto & owned : buffers) {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(owned.get());
+            if (ggml_backend_buft_is_host(buft)) {
+                continue;
+            }
+            if (!restore_buft) {
+                restore_buft = buft;
+            } else if (restore_buft != buft) {
+                LLAMA_LOG_ERROR("%s: mixed device buffer types in one model context\n", __func__);
+                restore_buft = nullptr;
+                break;
+            }
+            original_size += ggml_backend_buffer_get_size(owned.get());
+            has_device_buffer = true;
+        }
+
+        if (!has_device_buffer) {
+            continue;
+        }
+        if (!restore_buft) {
+            break;
+        }
+
+        size_t cpu_size = 0;
+        if (!migrate_model_context_buffers(ctx.get(), buffers, cpu_buft, &cpu_size)) {
+            LLAMA_LOG_ERROR("%s: failed to migrate model context %zu to CPU\n", __func__, ctx_index);
+            break;
+        }
+
+        pimpl->gpu_swap_entries.push_back({ctx_index, restore_buft, original_size, true});
+        pimpl->gpu_swap_bytes += original_size;
+        LLAMA_LOG_INFO("%s: migrated model context %zu from %s to CPU (device %.2f MiB, CPU %.2f MiB)\n",
+            __func__, ctx_index, ggml_backend_buft_name(restore_buft),
+            original_size / 1024.0 / 1024.0, cpu_size / 1024.0 / 1024.0);
+    }
+
+    size_t expected_device_contexts = 0;
+    for (const auto & [ctx, buffers] : pimpl->ctxs_bufs) {
+        GGML_UNUSED(ctx);
+        for (const auto & owned : buffers) {
+            if (!ggml_backend_buft_is_host(ggml_backend_buffer_get_type(owned.get()))) {
+                expected_device_contexts++;
+                break;
+            }
+        }
+    }
+
+    // A successful migration leaves no model-owned device buffers behind.
+    if (expected_device_contexts == 0 && !pimpl->gpu_swap_entries.empty()) {
+        return true;
+    }
+
+    bool rollback_ok = true;
+    for (auto it = pimpl->gpu_swap_entries.rbegin(); it != pimpl->gpu_swap_entries.rend(); ++it) {
+        if (!it->on_cpu) {
+            continue;
+        }
+        auto & [ctx, buffers] = pimpl->ctxs_bufs[it->ctx_index];
+        if (migrate_model_context_buffers(ctx.get(), buffers, it->restore_buft, nullptr)) {
+            it->on_cpu = false;
+        } else {
+            rollback_ok = false;
+        }
+    }
+
+    if (rollback_ok) {
+        pimpl->gpu_swap_entries.clear();
+        pimpl->gpu_swap_bytes = 0;
+    }
+    return false;
+}
+
+bool llama_model::gpu_swap_to_gpu() {
+    std::lock_guard<std::mutex> lock(pimpl->gpu_swap_mutex);
+    if (pimpl->gpu_swap_entries.empty()) {
+        return true;
+    }
+
+    bool restored = true;
+    for (auto & entry : pimpl->gpu_swap_entries) {
+        if (!entry.on_cpu) {
+            continue;
+        }
+        auto & [ctx, buffers] = pimpl->ctxs_bufs[entry.ctx_index];
+        size_t gpu_size = 0;
+        if (!migrate_model_context_buffers(ctx.get(), buffers, entry.restore_buft, &gpu_size)) {
+            LLAMA_LOG_ERROR("%s: failed to restore model context %zu to %s\n",
+                __func__, entry.ctx_index, ggml_backend_buft_name(entry.restore_buft));
+            restored = false;
+            break;
+        }
+        entry.on_cpu = false;
+        LLAMA_LOG_INFO("%s: restored model context %zu to %s (%.2f MiB)\n",
+            __func__, entry.ctx_index, ggml_backend_buft_name(entry.restore_buft), gpu_size / 1024.0 / 1024.0);
+    }
+
+    if (restored && std::none_of(
+            pimpl->gpu_swap_entries.begin(),
+            pimpl->gpu_swap_entries.end(),
+            [](const impl::gpu_swap_entry & entry) { return entry.on_cpu; })) {
+        pimpl->gpu_swap_entries.clear();
+        pimpl->gpu_swap_bytes = 0;
+        return true;
+    }
+    return false;
+}
+
+bool llama_model::gpu_swap_active() const {
+    std::lock_guard<std::mutex> lock(pimpl->gpu_swap_mutex);
+    return std::any_of(
+        pimpl->gpu_swap_entries.begin(),
+        pimpl->gpu_swap_entries.end(),
+        [](const impl::gpu_swap_entry & entry) { return entry.on_cpu; });
+}
+
+size_t llama_model::gpu_swap_size() const {
+    std::lock_guard<std::mutex> lock(pimpl->gpu_swap_mutex);
+    size_t result = 0;
+    for (const auto & entry : pimpl->gpu_swap_entries) {
+        if (entry.on_cpu) {
+            result += entry.original_size;
+        }
+    }
+    return result;
 }
 
 uint64_t llama_model::n_elements() const {
@@ -2581,4 +2973,24 @@ struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, co
             });
     if (it == model->tensors_by_name.end()) return nullptr;
     return it->second;
+}
+
+bool llama_model_gpu_swap_supported(const struct llama_model * model) {
+    return model && model->gpu_swap_supported();
+}
+
+bool llama_model_gpu_swap_to_cpu(struct llama_model * model) {
+    return model && model->gpu_swap_to_cpu();
+}
+
+bool llama_model_gpu_swap_to_gpu(struct llama_model * model) {
+    return model && model->gpu_swap_to_gpu();
+}
+
+bool llama_model_gpu_swap_active(const struct llama_model * model) {
+    return model && model->gpu_swap_active();
+}
+
+size_t llama_model_gpu_swap_size(const struct llama_model * model) {
+    return model ? model->gpu_swap_size() : 0;
 }

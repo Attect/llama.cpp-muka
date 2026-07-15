@@ -133,6 +133,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* image_max_tokens  */ -1,
         /* cb_eval           */ nullptr,
         /* cb_eval_user_data */ nullptr,
+        /* gpu_swap_mode     */ false,
     };
     return params;
 }
@@ -1571,46 +1572,67 @@ void mtmd_debug_preprocess_audio(mtmd_context * ctx, const std::vector<float> & 
 // These wrappers allow server code to manage clip GPU memory without directly accessing clip_ctx
 
 bool mtmd_gpu_swap_upload(mtmd_context * ctx) {
-    if (!ctx) return false;
-    // Upload both vision and audio clip models
-    bool ok = true;
-    if (ctx->ctx_v) {
-        ok = clip_gpu_upload(ctx->ctx_v) && ok;
+    if (!ctx) {
+        return false;
     }
-    if (ctx->ctx_a) {
-        ok = clip_gpu_upload(ctx->ctx_a) && ok;
+
+    std::vector<clip_ctx *> uploaded;
+    for (clip_ctx * clip : {ctx->ctx_v, ctx->ctx_a}) {
+        if (!clip) {
+            continue;
+        }
+        if (!clip_gpu_upload(clip)) {
+            for (auto it = uploaded.rbegin(); it != uploaded.rend(); ++it) {
+                (void) clip_gpu_download(*it);
+            }
+            return false;
+        }
+        uploaded.push_back(clip);
     }
-    return ok;
+    return !uploaded.empty();
 }
 
 bool mtmd_gpu_swap_download(mtmd_context * ctx) {
-    if (!ctx) return false;
+    if (!ctx) {
+        return false;
+    }
+
+    bool found = false;
     bool ok = true;
-    if (ctx->ctx_v) {
-        ok = clip_gpu_download(ctx->ctx_v) && ok;
+    for (clip_ctx * clip : {ctx->ctx_v, ctx->ctx_a}) {
+        if (!clip) {
+            continue;
+        }
+        found = true;
+        ok = clip_gpu_download(clip) && ok;
     }
-    if (ctx->ctx_a) {
-        ok = clip_gpu_download(ctx->ctx_a) && ok;
+    return found && ok;
+}
+
+bool mtmd_gpu_swap_supported(mtmd_context * ctx) {
+    if (!ctx) {
+        return false;
     }
-    return ok;
+
+    bool found = false;
+    for (clip_ctx * clip : {ctx->ctx_v, ctx->ctx_a}) {
+        if (!clip) {
+            continue;
+        }
+        found = true;
+        if (!clip_gpu_swap_supported(clip)) {
+            return false;
+        }
+    }
+    return found;
 }
 
 bool mtmd_is_gpu_swap_mode(mtmd_context * ctx) {
-    if (!ctx) return false;
-    // Check vision context (primary use case)
-    if (ctx->ctx_v) {
-        return clip_is_gpu_swap_mode(ctx->ctx_v);
+    if (!ctx) {
+        return false;
     }
-    if (ctx->ctx_a) {
-        return clip_is_gpu_swap_mode(ctx->ctx_a);
-    }
-    return false;
-}
-
-struct clip_ctx * mtmd_get_clip_ctx(mtmd_context * ctx) {
-    if (!ctx) return nullptr;
-    // Return vision context by default (used for GPU swap with image encoding)
-    return ctx->ctx_v ? ctx->ctx_v : ctx->ctx_a;
+    return (ctx->ctx_v && clip_is_gpu_swap_mode(ctx->ctx_v)) ||
+           (ctx->ctx_a && clip_is_gpu_swap_mode(ctx->ctx_a));
 }
 
 static void stub_log_callback(enum ggml_log_level, const char *, void *) {

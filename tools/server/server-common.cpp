@@ -11,6 +11,8 @@
 #include "server-gpu-swap.h"
 #include "mtmd-cache.h"
 
+#include <cctype>
+#include <cstring>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -172,7 +174,8 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 //
 
 static inline raw_buffer base64_decode(const std::string & encoded_string) {
-    // Remove common whitespace characters that may appear in base64 data (e.g. RFC 2045 line breaks)
+    // RFC 2045 permits whitespace between encoded characters. Validate the
+    // remaining padding before handing it to the shared decoder.
     std::string cleaned;
     cleaned.reserve(encoded_string.size());
     for (char c : encoded_string) {
@@ -180,6 +183,19 @@ static inline raw_buffer base64_decode(const std::string & encoded_string) {
             cleaned.push_back(c);
         }
     }
+    if (cleaned.empty() || cleaned.size() % 4 == 1) {
+        throw base64_error("invalid base64 length");
+    }
+
+    const size_t first_padding = cleaned.find('=');
+    if (first_padding != std::string::npos) {
+        const size_t padding = cleaned.size() - first_padding;
+        if (padding > 2 || cleaned.size() % 4 != 0 ||
+            cleaned.find_first_not_of('=', first_padding) != std::string::npos) {
+            throw base64_error("invalid base64 padding");
+        }
+    }
+
     std::string decoded = base64::decode(cleaned);
     return raw_buffer(decoded.begin(), decoded.end());
 }
@@ -494,28 +510,23 @@ int32_t server_tokens::process_chunk(
             size_t & n_tokens_out,
             gpu_swap_manager * gpu_swap_ctx,
             mtmd_cache * cache_ctx,
-            llama_model * model_for_swap) const {
+            server_mtmd_embedding * embedding_out,
+            const server_mtmd_embedding * embedding_in) const {
     const auto & chunk = find_chunk(idx);
-    auto chunk_type = mtmd_input_chunk_get_type(chunk.get());
-    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE
-                        ? "image" : "audio";
+    const auto chunk_type = mtmd_input_chunk_get_type(chunk.get());
+    const char * name = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "image" : "audio";
     SRV_INF("processing %s...\n", name);
-    int32_t n_batch = llama_n_batch(ctx);
-    int64_t t0 = ggml_time_ms();
+
+    const int32_t n_batch = llama_n_batch(ctx);
+    const int64_t t0 = ggml_time_ms();
 
     if (chunk_type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
-        // Text chunks: no GPU swap or cache needed
-        llama_pos new_n_past; // unused for now
-        int32_t result = mtmd_helper_eval_chunk_single(mctx, ctx,
-            chunk.get(),
-            pos,
-            seq_id,
-            n_batch,
-            true, // logits last
-            &new_n_past);
+        llama_pos new_n_past;
+        const int32_t result = mtmd_helper_eval_chunk_single(
+            mctx, ctx, chunk.get(), pos, seq_id, n_batch, true, &new_n_past);
         SRV_INF("%s processed in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
         if (result != 0) {
-            LOG_ERR("mtmd_helper_eval failed with status %d", result);
+            LOG_ERR("mtmd_helper_eval failed with status %d\n", result);
             n_tokens_out = 0;
             return result;
         }
@@ -523,43 +534,78 @@ int32_t server_tokens::process_chunk(
         return 0;
     }
 
-    // === Image/Audio chunk processing with GPU swap and cache ===
+    const bool is_image = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE;
+    const uint32_t expected_n_tokens = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk.get());
+    const uint32_t expected_n_embd = (uint32_t) llama_model_n_embd_inp(llama_get_model(ctx));
+    const bool expected_use_mrope = mtmd_decode_use_mrope(mctx);
+    if (expected_n_tokens == 0 || expected_n_embd == 0 ||
+        (size_t) expected_n_tokens > SIZE_MAX / (size_t) expected_n_embd) {
+        LOG_ERR("invalid %s embedding dimensions: %u x %u\n", name, expected_n_tokens, expected_n_embd);
+        n_tokens_out = 0;
+        return -1;
+    }
+    const size_t expected_values = (size_t) expected_n_tokens * expected_n_embd;
 
-    bool is_image = (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE);
     bool cache_hit = false;
+    bool memory_hit = false;
     std::vector<float> cached_embd;
-    uint32_t cached_n_tokens = 0, cached_n_embd = 0;
+    uint32_t cached_n_tokens = 0;
+    uint32_t cached_n_embd = 0;
     bool cached_use_mrope_pos = false;
 
-    // Step 1: Cache lookup (image chunks only)
-    if (cache_ctx && is_image) {
+    if (embedding_in &&
+        embedding_in->n_tokens == expected_n_tokens &&
+        embedding_in->n_embd == expected_n_embd &&
+        embedding_in->use_mrope_pos == expected_use_mrope &&
+        embedding_in->data.size() == expected_values) {
+        cached_embd = embedding_in->data;
+        cached_n_tokens = embedding_in->n_tokens;
+        cached_n_embd = embedding_in->n_embd;
+        cached_use_mrope_pos = embedding_in->use_mrope_pos;
+        cache_hit = true;
+        memory_hit = true;
+    }
+
+    if (!cache_hit && cache_ctx && is_image) {
         const char * chunk_id = mtmd_input_chunk_get_id(chunk.get());
         if (chunk_id && chunk_id[0] != '\0') {
             const auto * img_tokens = mtmd_input_chunk_get_tokens_image(chunk.get());
-            uint32_t img_nx = img_tokens ? (uint32_t)mtmd_image_tokens_get_nx(img_tokens) : 0;
-            uint32_t img_ny = img_tokens ? (uint32_t)mtmd_image_tokens_get_ny(img_tokens) : 0;
+            const uint32_t img_nx = img_tokens ? (uint32_t) mtmd_image_tokens_get_nx(img_tokens) : 0;
+            const uint32_t img_ny = img_tokens ? (uint32_t) mtmd_image_tokens_get_ny(img_tokens) : 0;
 
-            // Use a generic projector type for cache lookup
-            // The mmproj hash in the cache key already ensures model-specific invalidation
             cache_hit = cache_ctx->lookup_by_hash(
                 std::string(chunk_id),
-                img_nx, img_ny,
-                mtmd_projector_type::UNKNOWN,  // generic; mmproj_hash handles model specificity
+                img_nx,
+                img_ny,
+                mtmd_projector_type::UNKNOWN,
                 cached_embd,
-                cached_n_tokens, cached_n_embd,
+                cached_n_tokens,
+                cached_n_embd,
                 cached_use_mrope_pos);
+
+            if (cache_hit &&
+                (cached_n_tokens != expected_n_tokens ||
+                 cached_n_embd != expected_n_embd ||
+                 cached_use_mrope_pos != expected_use_mrope ||
+                 cached_embd.size() != expected_values)) {
+                SRV_WRN("ignoring incompatible %s cache entry (%u x %u, expected %u x %u)\n",
+                    name, cached_n_tokens, cached_n_embd, expected_n_tokens, expected_n_embd);
+                cached_embd.clear();
+                cache_hit = false;
+            }
         }
     }
 
-    // Step 2: GPU swap - offload model to CPU, upload mmproj to GPU
-    // Skip if cache hit (no encoding needed)
-    if (!cache_hit && gpu_swap_ctx && gpu_swap_ctx->enabled) {
-        if (!gpu_swap_ctx->swap_to_mmproj_gpu(mctx, model_for_swap, ctx)) {
-            SRV_WRN("GPU swap to mmproj failed, encoding will use current GPU state\n%s", "");
+    bool swapped = false;
+    if (!cache_hit && gpu_swap_ctx && gpu_swap_ctx->is_enabled()) {
+        if (!gpu_swap_ctx->swap_to_mmproj_gpu(mctx)) {
+            LOG_ERR("failed to swap model/mmproj state before %s encoding\n", name);
+            n_tokens_out = 0;
+            return -1;
         }
+        swapped = true;
     }
 
-    // Step 3: Encode the image/audio chunk (skip if cache hit)
     float * embd = nullptr;
     int32_t result = 0;
 
@@ -568,68 +614,70 @@ int32_t server_tokens::process_chunk(
         result = mtmd_encode_chunk(mctx, chunk.get());
         if (result != 0) {
             LOG_ERR("failed to encode %s slice\n", name);
-            // Swap back model even on failure
-            if (gpu_swap_ctx && gpu_swap_ctx->enabled && model_for_swap) {
-                gpu_swap_ctx->swap_to_model_gpu(mctx, model_for_swap, ctx);
+            if (swapped && !gpu_swap_ctx->swap_to_model_gpu(mctx)) {
+                LOG_ERR("failed to restore model after %s encoding error\n", name);
             }
             n_tokens_out = 0;
             return result;
         }
-        embd = mtmd_get_output_embd(mctx);
 
-        // Step 3b: Cache store (image chunks only)
+        embd = mtmd_get_output_embd(mctx);
+        if (!embd) {
+            LOG_ERR("%s encoder returned no embedding data\n", name);
+            if (swapped) {
+                (void) gpu_swap_ctx->swap_to_model_gpu(mctx);
+            }
+            n_tokens_out = 0;
+            return -1;
+        }
+
         if (cache_ctx && is_image) {
             const char * chunk_id = mtmd_input_chunk_get_id(chunk.get());
             if (chunk_id && chunk_id[0] != '\0') {
                 const auto * img_tokens = mtmd_input_chunk_get_tokens_image(chunk.get());
-                uint32_t img_nx = img_tokens ? (uint32_t)mtmd_image_tokens_get_nx(img_tokens) : 0;
-                uint32_t img_ny = img_tokens ? (uint32_t)mtmd_image_tokens_get_ny(img_tokens) : 0;
-                uint32_t n_tokens = (uint32_t)mtmd_input_chunk_get_n_tokens(chunk.get());
-                const llama_model * lmodel = llama_get_model(ctx);
-                uint32_t n_embd = (uint32_t)llama_model_n_embd_inp(lmodel);
-
-                bool use_mrope = mtmd_decode_use_mrope(mctx);
-
-                cache_ctx->store_by_hash(
+                const uint32_t img_nx = img_tokens ? (uint32_t) mtmd_image_tokens_get_nx(img_tokens) : 0;
+                const uint32_t img_ny = img_tokens ? (uint32_t) mtmd_image_tokens_get_ny(img_tokens) : 0;
+                (void) cache_ctx->store_by_hash(
                     std::string(chunk_id),
-                    img_nx, img_ny,
+                    img_nx,
+                    img_ny,
                     mtmd_projector_type::UNKNOWN,
                     embd,
-                    n_tokens, n_embd,
-                    use_mrope);
+                    expected_n_tokens,
+                    expected_n_embd,
+                    expected_use_mrope);
             }
         }
     } else {
-        SRV_INF("%s cache hit, skipping encode\n", name);
+        SRV_INF("%s %s cache hit, skipping encode\n", name, memory_hit ? "in-memory" : "disk");
         embd = cached_embd.data();
     }
 
-    // Step 4: GPU swap - upload model back to GPU, download mmproj from CPU
-    // Only needed if we actually encoded the image (cache miss)
-    // If cache hit, mmproj was never uploaded so no need to swap back
-    if (!cache_hit && gpu_swap_ctx && gpu_swap_ctx->enabled && model_for_swap) {
-        if (!gpu_swap_ctx->swap_to_model_gpu(mctx, model_for_swap, ctx)) {
-            SRV_WRN("GPU swap to model failed, decode may be degraded\n%s", "");
-        }
+    if (embedding_out) {
+        embedding_out->data.assign(embd, embd + expected_values);
+        embedding_out->n_tokens = expected_n_tokens;
+        embedding_out->n_embd = expected_n_embd;
+        embedding_out->use_mrope_pos = expected_use_mrope;
     }
 
-    // Step 5: Decode the image/audio embeddings with the text model
+    if (swapped && !gpu_swap_ctx->swap_to_model_gpu(mctx)) {
+        LOG_ERR("failed to restore model GPU state after %s encoding\n", name);
+        n_tokens_out = 0;
+        return -1;
+    }
+
     llama_pos new_n_past;
-    result = mtmd_helper_decode_image_chunk(mctx, ctx,
-        chunk.get(),
-        embd,
-        pos,
-        seq_id,
-        n_batch,
-        &new_n_past);
+    result = mtmd_helper_decode_image_chunk(
+        mctx, ctx, chunk.get(), embd, pos, seq_id, n_batch, &new_n_past);
 
     SRV_INF("%s processed in %" PRId64 " ms\n", name, ggml_time_ms() - t0);
     if (result != 0) {
-        LOG_ERR("mtmd_helper_decode failed with status %d", result);
+        LOG_ERR("mtmd_helper_decode failed with status %d\n", result);
         n_tokens_out = 0;
         return result;
     }
-    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+
+    n_tokens_out = expected_n_tokens;
     return 0;
 }
 
@@ -772,18 +820,6 @@ size_t validate_utf8(const std::string& text) {
     return len;
 }
 
-// Computes FNV-1a hash of the data
-static std::string fnv_hash(const uint8_t * data, size_t len) {
-    const uint64_t fnv_prime = 0x100000001b3ULL;
-    uint64_t hash = 0xcbf29ce484222325ULL;
-
-    for (size_t i = 0; i < len; ++i) {
-        hash ^= data[i];
-        hash *= fnv_prime;
-    }
-    return std::to_string(hash);
-}
-
 server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
     mtmd::bitmaps bitmaps;
     for (auto & file : files) {
@@ -791,9 +827,12 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
         if (!bmp.ptr) {
             throw std::runtime_error("Failed to load image or audio file");
         }
-        // calculate bitmap hash (for KV caching)
-        std::string hash = fnv_hash(bmp.data(), bmp.n_bytes());
-        bmp.set_id(hash.c_str());
+        // Include geometry: identical bytes interpreted with different row
+        // widths represent different media and must not share cache entries.
+        const std::string content_id =
+            "sha256-v1:" + std::to_string(bmp.nx()) + "x" + std::to_string(bmp.ny()) + ":" +
+            mtmd_cache_sha256(bmp.data(), bmp.n_bytes());
+        bmp.set_id(content_id.c_str());
         bitmaps.entries.push_back(std::move(bmp));
     }
     // process prompt
@@ -966,26 +1005,32 @@ static void handle_media(
         std::vector<std::string> parts = string_split<std::string>(url, /*separator*/ ',');
         if (parts.size() != 2) {
             throw std::runtime_error("Invalid url value");
-        } else if (!string_starts_with(parts[0], "data:image/")) {
-            throw std::runtime_error("Invalid url format: " + parts[0]);
-        } else if (!string_ends_with(parts[0], "base64")) {
-            throw std::runtime_error("url must be base64 encoded");
         } else {
-            // SVG is not supported by any decoder (stb_image nor WIC)
-            std::string mime_prefix = "data:image/";
-            size_t mime_start = mime_prefix.size();
-            size_t mime_end = parts[0].find(';', mime_start);
-            if (mime_end == std::string::npos) {
-                mime_end = parts[0].size();
+            std::string media_header = parts[0];
+            std::transform(media_header.begin(), media_header.end(), media_header.begin(),
+                [](unsigned char c) { return (char) std::tolower(c); });
+            if (!string_starts_with(media_header, "data:image/")) {
+                throw std::runtime_error("Invalid url format: " + parts[0]);
             }
-            std::string mime_type = parts[0].substr(mime_start, mime_end - mime_start);
+
+            const size_t last_parameter = media_header.rfind(';');
+            if (last_parameter == std::string::npos || media_header.substr(last_parameter + 1) != "base64") {
+                throw std::runtime_error("url must be base64 encoded");
+            }
+
+            const size_t mime_start = strlen("data:image/");
+            const size_t mime_end = media_header.find(';', mime_start);
+            const std::string mime_type = media_header.substr(mime_start, mime_end - mime_start);
             if (mime_type == "svg" || mime_type == "svg+xml") {
                 throw std::runtime_error("Unsupported image format: " + mime_type +
                     ". Please convert to PNG or JPEG before sending.");
             }
-            auto base64_data = parts[1];
-            auto decoded_data = base64_decode(base64_data);
-            out_files.push_back(decoded_data);
+
+            auto decoded_data = base64_decode(parts[1]);
+            if (decoded_data.empty()) {
+                throw std::runtime_error("decoded image is empty");
+            }
+            out_files.push_back(std::move(decoded_data));
         }
     }
 }
