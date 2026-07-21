@@ -184,7 +184,9 @@ typedef struct {
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
-#define QK2_0 64
+// Q2_0 g128 (PrismML ternary format): one FP16 scale per 128 weights,
+// 2-bit codes packed 4 per byte -> 34 bytes per block (2.125 bits/weight).
+#define QK2_0 128
 typedef struct {
     ggml_half d;              // delta (scale)
     uint8_t qs[QK2_0 / 4];   // 2 bits per element
