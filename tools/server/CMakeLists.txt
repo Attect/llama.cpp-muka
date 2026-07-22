@@ -17,10 +17,14 @@ add_library(${TARGET} STATIC
     server-gpu-swap.h
     server-context.cpp
     server-context.h
+    server-stream.cpp
+    server-stream.h
     server-tools.cpp
     server-tools.h
     ../mtmd/mtmd-cache.cpp
     ../mtmd/mtmd-cache.h
+    server-schema.cpp
+    server-schema.h
 )
 
 if (BUILD_SHARED_LIBS)
