@@ -131,13 +131,6 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
  * server_tokens is a helper to manage the input tokens and image for the server.
  * it is made this way to simplify the logic of KV cache management.
  */
-struct server_mtmd_embedding {
-    std::vector<float> data;
-    uint32_t n_tokens = 0;
-    uint32_t n_embd = 0;
-    bool use_mrope_pos = false;
-};
-
 struct server_tokens {
     bool has_mtmd = false;
 
@@ -237,20 +230,6 @@ public:
 
     // make sure all text tokens are within the vocab range
     bool validate(const struct llama_context * ctx) const;
-
-    // encode and decode the image chunk
-    // gpu_swap_ctx and cache_ctx are optional; when provided, GPU swap and cache are integrated
-    int32_t process_chunk(
-                llama_context * ctx,
-                mtmd_context * mctx,
-                size_t idx,
-                llama_pos pos,
-                int32_t seq_id,
-                size_t & n_tokens_out,
-                gpu_swap_manager * gpu_swap_ctx = nullptr,
-                mtmd_cache * cache_ctx = nullptr,
-                server_mtmd_embedding * embedding_out = nullptr,
-                const server_mtmd_embedding * embedding_in = nullptr) const;
 
     server_tokens clone() const;
 };

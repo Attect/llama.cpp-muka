@@ -694,44 +694,86 @@ struct server_slot {
 
     // returns 0 on success
     // caller need to update prompt.tokens after a successful call to keep track of the processing progress
-    int process_mtmd_chunk(size_t idx, size_t & n_tokens_out) {
+    // gpu_swap_ctx and cache_ctx are optional; when provided, GPU swap and disk cache are integrated
+    int process_mtmd_chunk(size_t idx, size_t & n_tokens_out,
+                           gpu_swap_manager * gpu_swap_ctx = nullptr,
+                           mtmd_cache * cache_ctx = nullptr) {
         GGML_ASSERT(mctx);
         const auto & input_tokens = task->tokens;
         const auto & chunk = input_tokens.find_chunk(idx);
         int32_t res = 0;
 
+        const auto chunk_type = mtmd_input_chunk_get_type(chunk.get());
+        const bool is_image   = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE;
+
+        const uint32_t n_tokens  = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk.get());
+        const uint32_t n_embd    = (uint32_t) llama_model_n_embd_inp(llama_get_model(ctx_tgt));
+        const bool     use_mrope = mtmd_decode_use_mrope(mctx);
+        if (n_tokens == 0 || n_embd == 0 || (size_t) n_tokens > SIZE_MAX / (size_t) n_embd) {
+            SLT_ERR(*this, "invalid mtmd chunk embedding dimensions: %u x %u\n", n_tokens, n_embd);
+            return -1;
+        }
+
+        // decode the given embeddings into the target context
+        // MTP draft contexts sharing the same model receive the exact same
+        // embedding instead of running the mmproj a second time
+        auto decode_embd = [&](float * embd) -> int32_t {
+            void * cb_data = spec;
+            static auto cb = [](llama_batch batch, void * user_data) {
+                common_speculative * spec = static_cast<common_speculative *>(user_data);
+                if (!common_speculative_process(spec, batch)) {
+                    return 1;
+                }
+                return 0;
+            };
+
+            llama_pos new_n_past; // unused for now
+            res = mtmd_helper_decode_image_chunk(
+                mctx,
+                ctx_tgt,
+                chunk.get(),
+                embd,
+                prompt.tokens.pos_next(),
+                id,
+                llama_n_batch(ctx_tgt),
+                &new_n_past,
+                cb,
+                cb_data
+            );
+            if (res != 0) {
+                SLT_ERR(*this, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
+                return -1;
+            }
+
+            if (ctx_dft) {
+                llama_pos new_n_past_dft; // unused for now
+                res = mtmd_helper_decode_image_chunk(
+                    mctx,
+                    ctx_dft,
+                    chunk.get(),
+                    embd,
+                    prompt.tokens.pos_next(),
+                    id,
+                    llama_n_batch(ctx_dft),
+                    &new_n_past_dft,
+                    nullptr,
+                    nullptr
+                );
+                if (res != 0) {
+                    SLT_ERR(*this, "failed to decode mtmd chunk on draft context, idx = %zu, res = %d\n", idx, res);
+                    return -1;
+                }
+            }
+
+            n_tokens_out = n_tokens;
+            return 0; // success
+        };
+
         auto try_decode = [&]() -> int32_t {
             if (mbatch) {
                 float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
                 if (embd) {
-                    void * cb_data = spec;
-                    static auto cb = [](llama_batch batch, void * user_data) {
-                        common_speculative * spec = static_cast<common_speculative *>(user_data);
-                        if (!common_speculative_process(spec, batch)) {
-                            return 1;
-                        }
-                        return 0;
-                    };
-
-                    llama_pos new_n_past; // unused for now
-                    res = mtmd_helper_decode_image_chunk(
-                        mctx,
-                        ctx_tgt,
-                        chunk.get(),
-                        embd,
-                        prompt.tokens.pos_next(),
-                        id,
-                        llama_n_batch(ctx_tgt),
-                        &new_n_past,
-                        cb,
-                        cb_data
-                    );
-                    if (res != 0) {
-                        SLT_ERR(*this, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
-                        return -1;
-                    }
-                    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
-                    return 0; // success
+                    return decode_embd(embd);
                 }
             }
             return 1; // (non-error) need to create & encode batch
@@ -747,6 +789,56 @@ struct server_slot {
             return res;
         }
 
+        // disk cache lookup: skip encoding entirely on a hit
+        if (cache_ctx && is_image) {
+            const char * chunk_id = mtmd_input_chunk_get_id(chunk.get());
+            if (chunk_id && chunk_id[0] != '\0') {
+                const auto * img_tokens = mtmd_input_chunk_get_tokens_image(chunk.get());
+                const uint32_t img_nx = img_tokens ? (uint32_t) mtmd_image_tokens_get_nx(img_tokens) : 0;
+                const uint32_t img_ny = img_tokens ? (uint32_t) mtmd_image_tokens_get_ny(img_tokens) : 0;
+
+                std::vector<float> cached_embd;
+                uint32_t cached_n_tokens = 0;
+                uint32_t cached_n_embd   = 0;
+                bool cached_use_mrope_pos = false;
+
+                bool cache_hit = cache_ctx->lookup_by_hash(
+                    chunk_id,
+                    img_nx,
+                    img_ny,
+                    mtmd_projector_type::UNKNOWN,
+                    cached_embd,
+                    cached_n_tokens,
+                    cached_n_embd,
+                    cached_use_mrope_pos);
+
+                if (cache_hit &&
+                    (cached_n_tokens != n_tokens ||
+                     cached_n_embd   != n_embd   ||
+                     cached_use_mrope_pos != use_mrope ||
+                     cached_embd.size() != (size_t) n_tokens * n_embd)) {
+                    SLT_WRN(*this, "ignoring incompatible mtmd cache entry (%u x %u, expected %u x %u)\n",
+                            cached_n_tokens, cached_n_embd, n_tokens, n_embd);
+                    cache_hit = false;
+                }
+
+                if (cache_hit) {
+                    SLT_INF(*this, "%s", "image disk cache hit, skipping encode\n");
+                    return decode_embd(cached_embd.data());
+                }
+            }
+        }
+
+        // swap the text model out and the mmproj in before encoding
+        bool swapped = false;
+        if (gpu_swap_ctx && gpu_swap_ctx->is_enabled()) {
+            if (!gpu_swap_ctx->swap_to_mmproj_gpu(mctx)) {
+                SLT_ERR(*this, "%s", "failed to swap model/mmproj state before mtmd encoding\n");
+                return -1;
+            }
+            swapped = true;
+        }
+
         // otherwise, the batch is either uninitialized or is used up
         // we need to create & encode a new batch
         mbatch.reset(mtmd_batch_init(mctx));
@@ -754,6 +846,7 @@ struct server_slot {
         GGML_ASSERT(res == 0); // we should never have an empty batch
 
         // try batching as much as possible
+        std::vector<const mtmd_input_chunk *> batch_chunks = { chunk.get() };
         int n_added = 1;
         size_t idx_cur = idx;
         while (res == 0) {
@@ -762,7 +855,10 @@ struct server_slot {
                 break;
             }
             res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
-            n_added += (res == 0 ? 1 : 0);
+            if (res == 0) {
+                n_added++;
+                batch_chunks.push_back(next_chunk->get());
+            }
             idx_cur = next_idx;
             SLT_DBG(*this, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
             // if res != 0, batch is full or chunk is not compatible -> this loop breaks
@@ -772,9 +868,45 @@ struct server_slot {
         SLT_TRC(*this, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
         res = mtmd_batch_encode(mbatch.get());
+
+        // restore the text model on GPU before decoding
+        if (swapped && !gpu_swap_ctx->swap_to_model_gpu(mctx)) {
+            SLT_ERR(*this, "%s", "failed to restore model GPU state after mtmd encoding\n");
+            return -1;
+        }
+
         if (res != 0) {
             SLT_ERR(*this, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
             return -1;
+        }
+
+        // store the encoded embeddings to the disk cache
+        if (cache_ctx) {
+            for (const auto * c : batch_chunks) {
+                if (mtmd_input_chunk_get_type(c) != MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+                    continue;
+                }
+                const char * c_id = mtmd_input_chunk_get_id(c);
+                if (!c_id || c_id[0] == '\0') {
+                    continue;
+                }
+                float * embd = mtmd_batch_get_output_embd(mbatch.get(), c);
+                if (!embd) {
+                    continue;
+                }
+                const auto * img_tokens = mtmd_input_chunk_get_tokens_image(c);
+                const uint32_t img_nx = img_tokens ? (uint32_t) mtmd_image_tokens_get_nx(img_tokens) : 0;
+                const uint32_t img_ny = img_tokens ? (uint32_t) mtmd_image_tokens_get_ny(img_tokens) : 0;
+                (void) cache_ctx->store_by_hash(
+                    c_id,
+                    img_nx,
+                    img_ny,
+                    mtmd_projector_type::UNKNOWN,
+                    embd,
+                    (uint32_t) mtmd_input_chunk_get_n_tokens(c),
+                    n_embd,
+                    use_mrope);
+            }
         }
 
         return try_decode();
@@ -3499,38 +3631,19 @@ private:
                     bool mtmd_failed = false;
 
                     // check if we should process the image
+                    // encoding is batched via mtmd_batch; GPU swap, disk cache and
+                    // MTP draft mirroring are handled inside process_mtmd_chunk()
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         const auto cur_token_idx = slot.prompt.n_tokens();
 
-                        // Encode once on the target context. MTP draft contexts sharing
-                        // the same model reuse the exact embedding instead of running the
-                        // mmproj a second time on CPU.
                         size_t n_tokens_out = 0;
-                        server_mtmd_embedding shared_embedding;
-                        int32_t res = input_tokens.process_chunk(
-                            ctx_tgt, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(),
-                            slot.id, n_tokens_out, gpu_swap.get(), mtmd_cache_ctx.get(),
-                            ctx_dft ? &shared_embedding : nullptr, nullptr);
+                        int32_t res = slot.process_mtmd_chunk(cur_token_idx, n_tokens_out, gpu_swap.get(), mtmd_cache_ctx.get());
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
                             slot.release();
                             mtmd_failed = true;
                             break;
-                        }
-
-                        if (ctx_dft) {
-                            size_t n_tokens_dft = 0;
-                            res = input_tokens.process_chunk(
-                                ctx_dft, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(),
-                                slot.id, n_tokens_dft, nullptr, mtmd_cache_ctx.get(), nullptr, &shared_embedding);
-                            if (res != 0 || n_tokens_dft != n_tokens_out) {
-                                SLT_ERR(slot, "failed to process multi-modal data on draft context, res = %d\n", res);
-                                send_error(slot, "failed to process image on draft context", ERROR_TYPE_SERVER);
-                                slot.release();
-                                mtmd_failed = true;
-                                break;
-                            }
                         }
 
                         slot.n_prompt_tokens_processed += n_tokens_out;
