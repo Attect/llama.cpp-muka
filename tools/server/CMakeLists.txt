@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
     server-tools.h
     ../mtmd/mtmd-cache.cpp
     ../mtmd/mtmd-cache.h
+    server-mcp.cpp
+    server-mcp.h
     server-schema.cpp
     server-schema.h
 )
