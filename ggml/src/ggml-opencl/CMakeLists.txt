@@ -83,6 +83,7 @@ set(GGML_OPENCL_KERNELS
     mul_mv_f16_f32_l4
     mul_mv_f16_f32
     mul_mv_f32_f32
+    mul_mv_hadamard_f32
     mul_mv_q1_0_f32
     mul_mv_q1_0_f32_flat
     mul_mv_q2_0_f32

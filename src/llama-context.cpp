@@ -23,6 +23,81 @@
 // llama_context
 //
 
+// check that every Hadamard-folded weight is consumed through its activation transform, and that
+// every latent table read is followed by the inverse transform. must run on the pristine graph:
+// once the scheduler inserts cross-backend copies, the producer chain below no longer matches
+static void llama_verify_hadamard_graph(
+        ggml_cgraph * gf,
+        const llama_hadamard_rotations & rotations,
+        const llama_hadamard_rotations & inverses) {
+    auto unwrap = [](const ggml_tensor * t) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW)) {
+            t = t->src[0];
+        }
+        return t;
+    };
+
+    auto is_hadamard = [](const ggml_tensor * t) {
+        return t && t->op == GGML_OP_MUL_MAT &&
+            ((const int32_t *) t->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD;
+    };
+
+    std::map<const ggml_tensor *, bool> lookups;
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+
+        if (node->op == GGML_OP_GET_ROWS && inverses.count(node->src[0])) {
+            lookups.emplace(node, false);
+            continue;
+        }
+
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+
+        if (is_hadamard(node)) {
+            const auto lk = lookups.find(unwrap(node->src[1]));
+            if (lk != lookups.end()) {
+                lk->second = true;
+            }
+            continue;
+        }
+
+        const auto it = rotations.find(node->src[0]);
+        if (it == rotations.end()) {
+            continue;
+        }
+
+        const ggml_tensor * src = unwrap(node->src[1]);
+        if (!is_hadamard(src) || src->src[0] != it->second.rot) {
+            throw std::runtime_error(format(
+                "Hadamard-folded weight '%s' is consumed without its activation transform; "
+                "this graph's matmul path does not support prism.hadamard folding", node->src[0]->name));
+        }
+    }
+
+    for (const auto & [node, ok] : lookups) {
+        if (ok) {
+            continue;
+        }
+
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * consumer = ggml_graph_node(gf, i);
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                if (consumer->src[j] == node) {
+                    LLAMA_LOG_WARN("%s: '%s' consumes the un-inversed latent lookup at src[%d] (op %d, hint %d)\n",
+                        __func__, consumer->name, j, (int) consumer->op,
+                        consumer->op == GGML_OP_MUL_MAT ? ((const int32_t *) consumer->op_params)[1] : -1);
+                }
+            }
+        }
+
+        throw std::runtime_error(format(
+            "Hadamard-latent table '%s' is read without the inverse transform", node->src[0]->name));
+    }
+}
+
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -1326,6 +1401,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (!hadamard_verified && (!model.hadamard_rotations.empty() || !model.hadamard_inverses.empty())) {
+            llama_verify_hadamard_graph(gf, model.hadamard_rotations, model.hadamard_inverses);
+            hadamard_verified = true;
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -2397,6 +2477,8 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.hadamard_rotations =*/ &model.hadamard_rotations,
+        /*.hadamard_inverses  =*/ &model.hadamard_inverses,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

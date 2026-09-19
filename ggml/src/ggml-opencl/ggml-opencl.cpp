@@ -659,6 +659,7 @@ struct ggml_backend_opencl_context {
     cl_program program_mul_mv_f16_f32_l4;
     cl_program program_mul_mv_f16_f32;
     cl_program program_mul_mv_f32_f32;
+    cl_program program_mul_mv_hadamard_f32;
     cl_program program_mul;
     cl_program program_mul_mat_f16_f32_tiled;
     cl_program program_mul_mm_f16_f32_kqv;
@@ -732,6 +733,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_rope_multi_f32, kernel_rope_multi_f16, kernel_rope_vision_f32, kernel_rope_vision_f16;
     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_f32_f32_pack, kernel_cpy_i32_i32;
     cl_kernel kernel_mul_mat_f32_f32;
+    cl_kernel kernel_mul_mat_hadamard_f32;
     cl_kernel kernel_mul_mat_f16_f16;
     cl_kernel kernel_mul_mat_f16_f32_1row;
     cl_kernel kernel_mul_mat_f16_f32;
@@ -2192,6 +2194,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
             build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
 
         CL_CHECK((backend_ctx->kernel_mul_mat_f32_f32 = clCreateKernel(backend_ctx->program_mul_mv_f32_f32, "kernel_mul_mat_f32_f32", &err), err));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mv_hadamard_f32
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mv_hadamard_f32.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mv_hadamard_f32.cl");
+#endif
+        backend_ctx->program_mul_mv_hadamard_f32 =
+            build_program_from_source(backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_mul_mat_hadamard_f32 = clCreateKernel(backend_ctx->program_mul_mv_hadamard_f32, "kernel_mul_mat_hadamard_f32", &err), err));
         GGML_LOG_CONT(".");
     }
 
@@ -7101,6 +7119,12 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_tensor *tensor) {
     return tensor->ne[1] >= 32768 && tensor->ne[0] >= 2048 && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
+// PrismML republishes this fork's group-128 ternary Q2_0 under the id PQ2_0 for Bonsai 2.
+// The block layout is byte-identical, so every OpenCL path below treats the two the same.
+static bool ggml_opencl_type_is_q2_0(ggml_type type) {
+    return type == GGML_TYPE_Q2_0 || type == GGML_TYPE_PQ2_0;
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -7294,7 +7318,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return op->src[1]->type == GGML_TYPE_F32;
             } else if (op->src[0]->type == GGML_TYPE_Q1_0) {
                 return op->src[1]->type == GGML_TYPE_F32;
-            } else if (op->src[0]->type == GGML_TYPE_Q2_0) {
+            } else if (ggml_opencl_type_is_q2_0(op->src[0]->type)) {
                 return op->src[1]->type == GGML_TYPE_F32;
             } else if (op->src[0]->type == GGML_TYPE_Q4_0) {
                 // Non-contig src0 routes through on-device dequant-to-f16.
@@ -7979,7 +8003,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     cl_command_queue queue = backend_ctx->queue;
 
 #ifdef GGML_OPENCL_SOA_Q
-    if (tensor->type == GGML_TYPE_Q1_0 || tensor->type == GGML_TYPE_Q2_0) {
+    if (tensor->type == GGML_TYPE_Q1_0 || ggml_opencl_type_is_q2_0(tensor->type)) {
         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
         GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
@@ -9530,7 +9554,7 @@ static void ggml_backend_opencl_buffer_get_tensor(ggml_backend_buffer_t buffer, 
     sync_with_other_backends(backend_ctx);
 
 #ifdef GGML_OPENCL_SOA_Q
-    if (tensor->type == GGML_TYPE_Q1_0 || tensor->type == GGML_TYPE_Q2_0) {
+    if (tensor->type == GGML_TYPE_Q1_0 || ggml_opencl_type_is_q2_0(tensor->type)) {
         ggml_tensor_extra_cl_q1_0 * extra = (ggml_tensor_extra_cl_q1_0 *)tensor->extra;
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
@@ -15877,7 +15901,7 @@ static void ggml_cl_mul_mat_q2_0_f32_adreno(ggml_backend_t backend, const ggml_t
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
 
-    GGML_ASSERT(src0->type == GGML_TYPE_Q2_0);
+    GGML_ASSERT(ggml_opencl_type_is_q2_0(src0->type));
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
@@ -18608,7 +18632,6 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    // quant kv without FA
     // used for non-contiguous src0 (the usual head-major permuted K view when n_head_kv>1)
     // AND for the contiguous case that occurs when n_head_kv==1 (e.g. Gemma-4 E2B)
     if ((src0t == GGML_TYPE_Q4_0 || src0t == GGML_TYPE_Q8_0) &&
@@ -18938,7 +18961,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
 
         // q2_0 x fp32
-        if (src0t == GGML_TYPE_Q2_0 && src1t == GGML_TYPE_F32 &&
+        if (ggml_opencl_type_is_q2_0(src0t) && src1t == GGML_TYPE_F32 &&
             enable_adreno_trans_weight(backend_ctx, src0)) {
                 ggml_cl_mul_mat_q2_0_f32_adreno(backend, src0, src1, dst);
                 return;
@@ -19000,6 +19023,39 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
     } // if (ne01 && ne1)
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
+
+    // PrismML folding keeps weights pre-rotated by a normalized Sylvester-Walsh
+    // matrix, so this product is that matrix times the activation. Reading the
+    // explicit n x n form costs a full matrix per transform; the butterfly does
+    // the same work without it.
+    if (((const int32_t *) dst->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD &&
+            ne00 == ne01 && ne00 <= 2048 && (ne00 & (ne00 - 1)) == 0 &&
+            ne10 % ne00 == 0 && nb10 == sizeof(float)) {
+        kernel = backend_ctx->kernel_mul_mat_hadamard_f32;
+
+        const int    ncols = ne10 / ne00;
+        const int    n     = ne00;
+        const cl_ulong nb11_ = nb11;
+        const cl_ulong nbd1  = (cl_ulong) dst->nb[1];
+        const float    scale = 1.0f / sqrtf((float) n);
+
+        CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra1->data_device));
+        CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset1));
+        CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
+        CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
+        CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &ncols));
+        CL_CHECK(clSetKernelArg(kernel, 5, sizeof(int),      &n));
+        CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &nb11_));
+        CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_ulong), &nbd1));
+        CL_CHECK(clSetKernelArg(kernel, 8, sizeof(float),    &scale));
+
+        const size_t nth = 256;
+        size_t global_work_size[] = { (size_t) ne11 * ncols * nth };
+        size_t local_work_size[]  = { nth };
+
+        backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, dst);
+        return;
+    }
 
     // GEMM using local memory
     // Current BK = 16, so ne00 % 16 == 0
@@ -19189,7 +19245,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
                 return;
             }
-            case GGML_TYPE_Q2_0: {
+            case GGML_TYPE_Q2_0:
+            case GGML_TYPE_PQ2_0: {
                 if (ne11 < 32) {
                     break;
                 }
@@ -19710,6 +19767,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         case GGML_TYPE_F32:
             //GGML_ASSERT(ne02 == ne12);
             GGML_ASSERT(src1t == GGML_TYPE_F32);
+
             kernel = backend_ctx->kernel_mul_mat_f32_f32;
             nrows = 4;
 
@@ -19933,7 +19991,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #endif // GGML_OPENCL_SOA_Q
             break;
         }
-        case GGML_TYPE_Q2_0: {
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_PQ2_0: {
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_q2_0_f32_flat;
 
@@ -20725,6 +20784,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         src0t == GGML_TYPE_Q8_0 ||
         src0t == GGML_TYPE_Q1_0 ||
         src0t == GGML_TYPE_Q2_0 ||
+        src0t == GGML_TYPE_PQ2_0 ||
         src0t == GGML_TYPE_IQ4_NL ||
         src0t == GGML_TYPE_Q2_K) {
         // Each SIMD group produces N_DST values in the result. Assuming each
