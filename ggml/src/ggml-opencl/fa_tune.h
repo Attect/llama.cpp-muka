@@ -15,8 +15,11 @@ struct ggml_opencl_fa_dim {
 // Default tuning covers Adreno 7xx/8xx mobile and X1-series laptop GPUs.
 static const ggml_opencl_fa_dim g_fa_dims_adreno_default[] = {
     { 40,  40, 64, 32, 1, 0}, { 64,  64, 64, 32, 2, 64},
-    { 80,  80, 64, 32, 2, 64}, { 96,  96, 64, 32, 2, 64},
-    {112, 112, 64, 32, 2, 64}, {128, 128, 64, 32, 2, 64},
+    // 72 is the head dim of the Bonsai 2 vision projector. DK_VEC is DK/4, so
+    // n_split has to divide 18; 2 does, same tile as the 80 entry.
+    { 72,  72, 64, 32, 2, 64}, { 80,  80, 64, 32, 2, 64},
+    { 96,  96, 64, 32, 2, 64}, {112, 112, 64, 32, 2, 64},
+    {128, 128, 64, 32, 2, 64},
     {192, 128, 16, 16, 1, 0},
     {192, 192, 16, 16, 1, 0},
     {256, 256, 16, 16, 16, 0},

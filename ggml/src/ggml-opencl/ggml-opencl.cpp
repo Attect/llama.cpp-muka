@@ -7458,7 +7458,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             const int dv = v->ne[0];
 
             const struct { int dk; int dv; } supported_dims[] = {
-                { 40,  40}, { 64,  64}, { 80,  80}, { 96,  96},
+                { 40,  40}, { 64,  64}, { 72,  72}, { 80,  80}, { 96,  96},
                 {112, 112}, {128, 128}, {192, 128},
                 {192, 192}, {256, 256},
                 {512, 512},
@@ -7472,6 +7472,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 }
             }
             if (!dims_supported) {
+                return false;
+            }
+
+            // 72 exists for the vision projector, whose queries are a whole patch
+            // grid. The single-query kernels split DK_VEC (72/4 = 18) over 4
+            // subgroups with integer division and would silently drop 2 of the 18
+            // float4 units; only the prefill path, which takes n_split = 2 from
+            // the tuning table, divides exactly.
+            if (dk == 72 && q->ne[1] == 1) {
                 return false;
             }
 
