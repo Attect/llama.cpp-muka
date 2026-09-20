@@ -801,6 +801,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_restore_block_iq4_nl_noshuffle;
     cl_kernel kernel_mul_mv_q1_0_f32, kernel_mul_mv_q1_0_f32_flat;
     cl_kernel kernel_mul_mv_q2_0_f32, kernel_mul_mv_q2_0_f32_flat;
+    cl_kernel kernel_mul_mv_ptq1_0_f32;
     cl_kernel kernel_mul_mat_q4_0_f32_1d_8x_flat, kernel_mul_mat_q4_0_f32_1d_16x_flat;
     cl_kernel kernel_mul_mv_q4_1_f32;
     cl_kernel kernel_mul_mv_q4_1_f32_flat;
@@ -1998,6 +1999,31 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mv_q2_0_f32_flat = clCreateKernel(prog, "kernel_mul_mv_q2_0_f32_flat", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mv_ptq1_0_f32
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mv_ptq1_0_f32.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mv_ptq1_0_f32.cl");
+#endif
+        // Only PTQ1_0 needs this program, so a driver that refuses to build it
+        // must not bring down the backend - supports_op checks for the null.
+        cl_program prog = build_program_from_source_ex(
+            backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts,
+            /*fatal=*/false, "mul_mv_ptq1_0_f32");
+
+        backend_ctx->kernel_mul_mv_ptq1_0_f32 = prog ?
+            clCreateKernel(prog, "kernel_mul_mv_ptq1_0_f32", &err) : nullptr;
+        if (backend_ctx->kernel_mul_mv_ptq1_0_f32 == nullptr) {
+            GGML_LOG_WARN("ggml_opencl: PTQ1_0 unavailable, falling back to CPU\n");
+            err = CL_SUCCESS;
+        }
+        if (prog) { CL_CHECK(clReleaseProgram(prog)); }
         GGML_LOG_CONT(".");
     }
 
@@ -7320,6 +7346,17 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 return op->src[1]->type == GGML_TYPE_F32;
             } else if (ggml_opencl_type_is_q2_0(op->src[0]->type)) {
                 return op->src[1]->type == GGML_TYPE_F32;
+            } else if (op->src[0]->type == GGML_TYPE_PTQ1_0) {
+                // PTQ1_0 has no flattened form, so it is served by a dedicated AoS
+                // kernel whose geometry is defined for Intel and Adreno SIMD widths.
+                // That kernel tiles over src0 rows only and re-reads the weights per
+                // src1 column, which is right for decoding and quadratic for prompt
+                // processing - leave batches to the CPU until there is a GEMM variant.
+                return op->src[1]->type == GGML_TYPE_F32 &&
+                       op->src[1]->ne[1] == 1 &&
+                       backend_ctx->kernel_mul_mv_ptq1_0_f32 != nullptr &&
+                       op->src[0]->ne[0] % ggml_blck_size(op->src[0]->type) == 0 &&
+                       (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == ADRENO);
             } else if (op->src[0]->type == GGML_TYPE_Q4_0) {
                 // Non-contig src0 routes through on-device dequant-to-f16.
                 return op->src[1]->type == GGML_TYPE_F32;
@@ -20068,6 +20105,44 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #endif // GGML_OPENCL_SOA_Q
             break;
         }
+        case GGML_TYPE_PTQ1_0: {
+            // Unlike Q1_0/Q2_0 this type has no flattened form: the quants are a
+            // base-3 code, so the kernel reads the block layout as stored.
+            kernel = backend_ctx->kernel_mul_mv_ptq1_0_f32;
+
+            if (backend_ctx->gpu_family == INTEL) {
+                nth0 = 16;
+                nth1 = 2;
+                ndst = nth1*4;
+            } else if (backend_ctx->gpu_family == ADRENO) {
+                nth0 = 64;
+                nth1 = 2;
+                ndst = nth1*4;
+            } else {
+                GGML_ASSERT(false && "TODO: Unknown GPU");
+            }
+
+            CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+            CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+            CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+            CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+            CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+            CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+            CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb01));
+            CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb02));
+            CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb03));
+            CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne12));
+            CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb11));
+            CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb12));
+            CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nb13));
+            CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne0));
+            CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &ne1));
+            CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+            CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+            break;
+        }
         case GGML_TYPE_Q4_0:
             // This should have been satisfied.
             GGML_ASSERT(ne11 == ne1);
@@ -20785,6 +20860,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         src0t == GGML_TYPE_Q1_0 ||
         src0t == GGML_TYPE_Q2_0 ||
         src0t == GGML_TYPE_PQ2_0 ||
+        src0t == GGML_TYPE_PTQ1_0 ||
         src0t == GGML_TYPE_IQ4_NL ||
         src0t == GGML_TYPE_Q2_K) {
         // Each SIMD group produces N_DST values in the result. Assuming each
