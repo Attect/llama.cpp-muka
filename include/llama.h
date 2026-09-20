@@ -569,6 +569,9 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
+    // number of position values per embedding (1, or 3 for mrope). llama_kv_cache::seq_add
+    // only supports 1, so callers that shift cached positions must check this first.
+    LLAMA_API int32_t llama_model_n_pos_per_embd(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
