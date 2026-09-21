@@ -881,6 +881,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mm_f16_f32_l4_lm;
     cl_kernel kernel_mul_mm_q1_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q2_0_f32_l4_lm;
+    cl_kernel kernel_mul_mm_ptq1_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_0_f32_l4_lm;
     cl_kernel kernel_mul_mm_q4_1_f32_l4_lm;
     cl_kernel kernel_mul_mm_q5_0_f32_l4_lm;
@@ -2424,6 +2425,31 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_mul_mm_q2_0_f32_l4_lm = clCreateKernel(prog, "kernel_mul_mm_q2_0_f32_l4_lm", &err), err));
         CL_CHECK(clReleaseProgram(prog));
+        GGML_LOG_CONT(".");
+    }
+
+    // mul_mm_ptq1_0_f32_l4_lm
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "mul_mm_ptq1_0_f32_l4_lm.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("mul_mm_ptq1_0_f32_l4_lm.cl");
+#endif
+        // As with the PTQ1_0 gemv, only this type needs the program, so a driver
+        // that refuses to build it must not bring down the backend.
+        cl_program prog = build_program_from_source_ex(
+            backend_ctx->context, backend_ctx->device, kernel_src.c_str(), compile_opts,
+            /*fatal=*/false, "mul_mm_ptq1_0_f32_l4_lm");
+
+        backend_ctx->kernel_mul_mm_ptq1_0_f32_l4_lm = prog ?
+            clCreateKernel(prog, "kernel_mul_mm_ptq1_0_f32_l4_lm", &err) : nullptr;
+        if (backend_ctx->kernel_mul_mm_ptq1_0_f32_l4_lm == nullptr) {
+            GGML_LOG_WARN("ggml_opencl: PTQ1_0 GEMM unavailable, falling back to CPU\n");
+            err = CL_SUCCESS;
+        }
+        if (prog) { CL_CHECK(clReleaseProgram(prog)); }
         GGML_LOG_CONT(".");
     }
 
@@ -7347,26 +7373,23 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             } else if (ggml_opencl_type_is_q2_0(op->src[0]->type)) {
                 return op->src[1]->type == GGML_TYPE_F32;
             } else if (op->src[0]->type == GGML_TYPE_PTQ1_0) {
-                // PTQ1_0 has no flattened form, so it is served by a dedicated AoS
-                // kernel whose geometry is defined for Intel and Adreno SIMD widths.
-                // That kernel tiles over src0 rows only and re-reads the weights per
-                // src1 column, which is right for decoding and quadratic for prompt
-                // processing - leave batches to the CPU until there is a GEMM variant.
+                // PTQ1_0 has no flattened form, so both of its kernels read the
+                // stored blocks: the gemv for narrow batches (it re-reads the
+                // weights per column, which is fine for decoding and quadratic
+                // beyond), and the tiled GEMM from 32 columns up.
                 //
-                // Kernels are compiled lazily, on the first OpenCL buffer, which can
-                // be later than this query; without the call below the null kernel
-                // reads as "unsupported" and every PTQ1_0 mul_mat sticks to the CPU.
+                // Claiming wide batches is also what gets the weights onto the
+                // device at all: llama picks a weight's buffer by probing this
+                // predicate with a mock src1 of 512 columns. Kernels are compiled
+                // lazily on the first OpenCL buffer, which can be later than that
+                // probe, hence the explicit load below.
                 load_cl_kernels(backend_ctx);
 
-                // Note the consequence of the ne[1] test: llama picks a weight's
-                // buffer by asking this predicate with a mock src1 of 512 columns,
-                // so as long as only single-token batches are claimed, PTQ1_0 weights
-                // stay in host memory and this kernel never runs. Measured on Adreno
-                // with the test removed: weights on GPU, 0.97 tok/s decode against
-                // 1.30 tok/s on CPU - the untiled kernel is not worth offloading.
+                const int64_t n_cols = op->src[1]->ne[1];
+
                 return op->src[1]->type == GGML_TYPE_F32 &&
-                       op->src[1]->ne[1] == 1 &&
                        backend_ctx->kernel_mul_mv_ptq1_0_f32 != nullptr &&
+                       (n_cols < 32 || backend_ctx->kernel_mul_mm_ptq1_0_f32_l4_lm != nullptr) &&
                        op->src[0]->ne[0] % ggml_blck_size(op->src[0]->type) == 0 &&
                        (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == ADRENO);
             } else if (op->src[0]->type == GGML_TYPE_Q4_0) {
@@ -19322,6 +19345,50 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 // SoA extra layout is shared with q1_0 (d + q buffers).
                 CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0_q1_0->q));
                 CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_mem),   &extra0_q1_0->d));
+                CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kernel,  6, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(kernel,  7, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &ne02));
+                CL_CHECK(clSetKernelArg(kernel,  9, sizeof(int),      &ne11));
+                CL_CHECK(clSetKernelArg(kernel, 10, sizeof(int),      &ne12));
+                CL_CHECK(clSetKernelArg(kernel, 11, sizeof(int),      &ne10)); // stride_a
+                CL_CHECK(clSetKernelArg(kernel, 12, sizeof(int),      &ne10)); // stride_b
+                CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &ne01)); // stride_d
+                CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &batch_stride_a));
+                CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &batch_stride_b));
+                CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &batch_stride_d));
+                CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &r2));
+                CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &r3));
+
+                // 64 is block tile size BM and BN - change here when BM and BN in the kernel are changed.
+                size_t global_work_size[] = {(size_t)(CEIL_DIV(ne01, 64)*nth0), (size_t)(CEIL_DIV(ne11, 64)), (size_t)ne12*ne13};
+                size_t local_work_size[] = {(size_t)nth0, 1, 1};
+
+                backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+                return;
+            }
+            case GGML_TYPE_PTQ1_0: {
+                if (ne11 < 32) {
+                    break;
+                }
+                if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+                    break;
+                }
+
+                kernel = backend_ctx->kernel_mul_mm_ptq1_0_f32_l4_lm;
+                nth0 = 128; // calculated as (BM*BN)/(TM*TN)
+
+                int batch_stride_a = ne00*ne01;
+                int batch_stride_b = ne10*ne11;
+                int batch_stride_d = ne0*ne1;
+
+                // No flattened form to point at, so the kernel gets the stored
+                // blocks and strides through them in weight units.
+                CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+                CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
                 CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extra1->data_device));
                 CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offset1));
                 CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrad->data_device));
