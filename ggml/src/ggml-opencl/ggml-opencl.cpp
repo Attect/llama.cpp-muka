@@ -7352,6 +7352,18 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 // That kernel tiles over src0 rows only and re-reads the weights per
                 // src1 column, which is right for decoding and quadratic for prompt
                 // processing - leave batches to the CPU until there is a GEMM variant.
+                //
+                // Kernels are compiled lazily, on the first OpenCL buffer, which can
+                // be later than this query; without the call below the null kernel
+                // reads as "unsupported" and every PTQ1_0 mul_mat sticks to the CPU.
+                load_cl_kernels(backend_ctx);
+
+                // Note the consequence of the ne[1] test: llama picks a weight's
+                // buffer by asking this predicate with a mock src1 of 512 columns,
+                // so as long as only single-token batches are claimed, PTQ1_0 weights
+                // stay in host memory and this kernel never runs. Measured on Adreno
+                // with the test removed: weights on GPU, 0.97 tok/s decode against
+                // 1.30 tok/s on CPU - the untiled kernel is not worth offloading.
                 return op->src[1]->type == GGML_TYPE_F32 &&
                        op->src[1]->ne[1] == 1 &&
                        backend_ctx->kernel_mul_mv_ptq1_0_f32 != nullptr &&
