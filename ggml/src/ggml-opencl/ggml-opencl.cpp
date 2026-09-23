@@ -564,6 +564,13 @@ struct ggml_backend_opencl_context {
     get_adreno_bin_kernel_func_t get_adreno_bin_kernel_func = nullptr;
     ggml_cl_compiler_version adreno_cl_compiler_version;
 
+    // FA kernels with mixed/quant K/V types (f32_f16, f32_q8_0, f32_q4_0) crash
+    // some A7x OpenCL compilers at build time (originally: Adreno 740 @ E031.41).
+    // Adreno 750 ships compiler E031.45+ and was validated safe on-device
+    // (vivo V2403A / SM8650, 2026-09-23: kernels compile and run, quantized KV +
+    // FA path works). 730/740 stay blocked; widen here once validated on 8 Gen2.
+    bool fa_mixed_kernels_safe = false;
+
     std::string kernel_compile_opts;  // cached for lazy-compiled kernels.
 
     int adreno_wave_size;
@@ -5970,6 +5977,17 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
         (backend_ctx->adreno_cl_compiler_version.type == E031 && backend_ctx->adreno_cl_compiler_version.major >= 47) ||
         (backend_ctx->adreno_cl_compiler_version.type == DX   && backend_ctx->adreno_cl_compiler_version.major >= 17);
 
+    // FA kernels with mixed/quant K/V types crash some A7x compilers at build
+    // time (Adreno 740 @ E031.41). Adreno 750 @ E031.45+ validated safe on-device
+    // (vivo V2403A / SM8650, 2026-09-23) — without this, the blanket A7x skip
+    // disables FA on 8 Gen1/2/3 entirely, and llama.cpp then refuses any
+    // quantized V cache ("quantized V cache was requested, but this requires
+    // Flash Attention") whenever the model is offloaded to the GPU.
+    backend_ctx->fa_mixed_kernels_safe =
+        (strstr(dev_ctx->device_version.c_str(), "750") != nullptr ||
+         strstr(backend_ctx->device_name.c_str(), "750") != nullptr) &&
+        backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 45, 0, 0);
+
     size_t ext_str_size;
     clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, NULL, &ext_str_size);
     char *ext_buffer = (char *)alloca(ext_str_size + 1);
@@ -7549,8 +7567,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 
             // Some compilers for A7x (Adreno 740, compiler E031.41) crashes when
             // building FA kernels with mixed or quant types (f32_f16, f32_q8_0, f32_q4_0)
-            // Here we skip all A7x for these kernels to avoid crash
-            if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
+            // Skip these kernels on the affected A7x parts (Adreno 750 @ E031.45+
+            // is validated safe — see fa_mixed_kernels_safe).
+            if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X && !backend_ctx->fa_mixed_kernels_safe &&
                 (is_f32_f16 || is_f32_q8_0 || is_f32_q4_0)) {
                 return false;
             }
