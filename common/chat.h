@@ -331,6 +331,16 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
                                       bool                                 add_ass,
                                       bool                                 use_jinja);
 
+// Same as above, but lets the caller force use_jinja + pass the enable_thinking
+// template kwarg (the plain variant's legacy path cannot carry kwargs).
+// Used by MoeApk's ai_chat.cpp for the "deep thinking" toggle.
+std::string common_chat_format_single_ex(const struct common_chat_templates * tmpls,
+                                         const std::vector<common_chat_msg> & past_msg,
+                                         const common_chat_msg &              new_msg,
+                                         bool                                 add_ass,
+                                         bool                                 use_jinja,
+                                         bool                                 enable_thinking);
+
 // Returns an example of formatted chat
 std::string common_chat_format_example(const struct common_chat_templates *       tmpls,
                                        bool                                       use_jinja,

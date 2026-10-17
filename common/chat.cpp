@@ -609,10 +609,20 @@ std::string common_chat_format_single(const struct common_chat_templates * tmpls
                                       const common_chat_msg &              new_msg,
                                       bool                                 add_ass,
                                       bool                                 use_jinja) {
+    return common_chat_format_single_ex(tmpls, past_msg, new_msg, add_ass, use_jinja, /* enable_thinking */ true);
+}
+
+std::string common_chat_format_single_ex(const struct common_chat_templates * tmpls,
+                                         const std::vector<common_chat_msg> & past_msg,
+                                         const common_chat_msg &              new_msg,
+                                         bool                                 add_ass,
+                                         bool                                 use_jinja,
+                                         bool                                 enable_thinking) {
     common_chat_templates_inputs inputs;
-    inputs.use_jinja = use_jinja;
-    inputs.add_bos   = tmpls->add_bos;
-    inputs.add_eos   = tmpls->add_eos;
+    inputs.use_jinja       = use_jinja;
+    inputs.add_bos         = tmpls->add_bos;
+    inputs.add_eos         = tmpls->add_eos;
+    inputs.enable_thinking = enable_thinking;
 
     std::string fmt_past_msg;
     if (!past_msg.empty()) {
